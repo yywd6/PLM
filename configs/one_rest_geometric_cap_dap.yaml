@@ -1,0 +1,55 @@
+protocol: one_rest
+train_category: car
+exclude_train_category_from_test: true
+zero_shot_target: true
+use_target_anomaly_for_training: false
+save_per_category_metrics: true
+save_mean_metrics: true
+
+use_geometric_cap: true
+use_geometric_dap: true
+num_geometric_abnormal_prompts: 10
+num_normal_tokens: 4
+num_abnormal_tokens: 4
+geometric_prompt_suffix: point cloud patch
+top_m_abnormal_patches: 10
+lambda_prompt_orthogonal: 0.1
+lambda_prior: 0.1
+freeze_plm: true
+freeze_text_encoder: true
+freeze_visual_adapter: false
+baseline_checkpoint: null
+prompt_learning_rate: 0.001
+prior_learning_rate: 0.001
+prior_hidden_dim: 512
+patch_geo_desc_dim: 4
+
+dataset_name: Real3D
+data_root: /home/objectdec/data/Point3D/Real3D-AD-PCD_btp_fps2048
+model_path: ./pretrained/ULIP-2-PointBERT-10k-xyzrgb-pc-vit_g-objaverse_shapenet-pretrained.pt
+train_split: test
+test_split: test
+output_root: ./outputs/one_rest_geometric_cap_dap
+return_layers: [2, 5, 8, 11]
+feature_layer: 11
+feature_layers: [2, 5, 8, 11]
+token_dim: 384
+text_dim: 1280
+temperature: 0.07
+top_percent: 0.2
+epochs: 100
+batch_size: 4
+num_workers: 4
+weight_decay: 0.0001
+focal_weight: 1.0
+dice_weight: 1.0
+object_weight: 0.5
+focal_gamma: 2.0
+focal_alpha: 0.25
+num_points: 2048
+seed: 111
+device: cuda
+
+# Only used when use_geometric_cap=false.
+normal_templates: [a 3D point cloud of a normal object]
+anomaly_templates: [a 3D point cloud of a defective object]
