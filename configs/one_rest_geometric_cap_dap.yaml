@@ -11,7 +11,7 @@ use_geometric_dap: true
 num_geometric_abnormal_prompts: 10
 num_normal_tokens: 4
 num_abnormal_tokens: 4
-geometric_prompt_suffix: point cloud patch
+geometric_prompt_suffix: "a point cloud patch of {article} {category}"
 top_m_abnormal_patches: 10
 lambda_prompt_orthogonal: 0.1
 lambda_prior: 0.1
@@ -22,7 +22,12 @@ baseline_checkpoint: null
 prompt_learning_rate: 0.001
 prior_learning_rate: 0.001
 prior_hidden_dim: 512
-patch_geo_desc_dim: 4
+patch_geo_desc_dim: 4  # legacy local descriptor setting; retained for compatibility
+geometry_graph_dim: 128
+geometry_graph_k: 8
+geometry_graph_layers: 2
+geometry_routing_temperature: 0.2
+lambda_geometry_invariance: 0
 
 dataset_name: Real3D
 data_root: /home/objectdec/data/Point3D/Real3D-AD-PCD_btp_fps2048
@@ -36,6 +41,7 @@ feature_layers: [2, 5, 8, 11]
 token_dim: 384
 text_dim: 1280
 temperature: 0.07
+global_alpha: 0.0
 top_percent: 0.2
 epochs: 100
 batch_size: 4
@@ -45,7 +51,7 @@ focal_weight: 1.0
 dice_weight: 1.0
 object_weight: 0.5
 focal_gamma: 2.0
-focal_alpha: 0.25
+focal_alpha: 0.5
 num_points: 2048
 seed: 111
 device: cuda

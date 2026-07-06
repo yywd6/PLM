@@ -93,3 +93,22 @@ def pool_patch_logits(patch_logits, top_percent=0.2):
         raise ValueError("top_percent must be in (0, 1]")
     count = max(1, int(patch_logits.shape[1] * top_percent))
     return torch.topk(patch_logits, k=count, dim=1).values.mean(dim=1)
+
+
+def aggregate_object_probability(global_logits, patch_logits, global_alpha=0.5, top_percent=0.2):
+    """Combine ULIP global and top-k local anomaly probabilities."""
+    if not 0.0 <= global_alpha <= 1.0:
+        raise ValueError("global_alpha must be in [0, 1]")
+    if not 0 < top_percent <= 1:
+        raise ValueError("top_percent must be in (0, 1]")
+    if global_logits.ndim != 1:
+        raise ValueError("global_logits must have shape [B]")
+    if patch_logits.ndim != 2 or patch_logits.shape[0] != global_logits.shape[0]:
+        raise ValueError("patch_logits must have shape [B, G]")
+
+    # Float64 avoids sigmoid saturation for similarity logits near +/-30.
+    global_prob = torch.sigmoid(global_logits.double())
+    patch_prob = torch.sigmoid(patch_logits.double())
+    count = max(1, int(patch_prob.shape[1] * top_percent))
+    local_prob = torch.topk(patch_prob, k=count, dim=1).values.mean(dim=1)
+    return global_alpha * global_prob + (1.0 - global_alpha) * local_prob

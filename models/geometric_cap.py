@@ -6,7 +6,10 @@ import torch.nn.functional as F
 
 
 class GeometricCompoundPromptLearner(nn.Module):
-    """Shared normal tokens plus K abnormal-specific token groups."""
+    """Shared normal tokens plus K abnormal-specific token groups.
+
+    Prompts use the category-conditioned ``a point cloud patch of {article} {category}`` suffix.
+    """
 
     def __init__(
         self,
@@ -15,7 +18,7 @@ class GeometricCompoundPromptLearner(nn.Module):
         num_abnormal_prompts=10,
         num_normal_tokens=4,
         num_abnormal_tokens=4,
-        suffix="point cloud patch",
+        suffix="a point cloud patch of {article} {category}",
     ):
         super().__init__()
         if num_abnormal_prompts < 1:
@@ -23,7 +26,9 @@ class GeometricCompoundPromptLearner(nn.Module):
         self.num_abnormal_prompts = int(num_abnormal_prompts)
         self.num_normal_tokens = int(num_normal_tokens)
         self.num_abnormal_tokens = int(num_abnormal_tokens)
-        self.suffix = suffix
+        self.suffix_template = str(suffix)
+        self.default_object_name = "object"
+        self.tokenizer = tokenizer
         token_width = clip_model.token_embedding.weight.shape[1]
         self.token_width = int(token_width)
 
@@ -34,57 +39,88 @@ class GeometricCompoundPromptLearner(nn.Module):
         nn.init.normal_(self.normal_tokens, std=0.02)
         nn.init.normal_(self.abnormal_tokens, std=0.02)
 
-        tokenized = tokenizer([suffix]).long()
-        if tokenized.ndim == 1:
-            tokenized = tokenized.unsqueeze(0)
-        with torch.no_grad():
-            embedded = clip_model.token_embedding(tokenized.to(clip_model.token_embedding.weight.device))
-        self.register_buffer("base_tokenized", tokenized.cpu())
-        self.register_buffer("prefix_embedding", embedded[:, :1].float().cpu())
-        self.register_buffer("suffix_embedding", embedded[:, 1:].float().cpu())
+    def _normalize_object_names(self, object_names, batch_size=None):
+        if object_names is None:
+            names = [self.default_object_name] * (batch_size or 1)
+        elif isinstance(object_names, str):
+            names = [object_names]
+        else:
+            names = [str(name) for name in object_names]
+        if not names or any(not name.strip() for name in names):
+            raise ValueError("object_names must contain non-empty category names")
+        if batch_size is not None and len(names) != batch_size:
+            raise ValueError(
+                f"object_names has {len(names)} entries, expected batch size {batch_size}"
+            )
+        return names
 
-    def _assemble(self, context, repeats=1):
+    def _assemble(self, context, clip_model, object_names):
         if context.ndim != 3:
             raise ValueError(f"context must be [P, T, C], got {tuple(context.shape)}")
         prompt_count, context_length, _ = context.shape
-        sequence_length = self.base_tokenized.shape[1]
+        names = self._normalize_object_names(object_names, prompt_count)
+        try:
+            suffixes = [
+                self.suffix_template.format(
+                    category=name,
+                    article="an" if name[0].lower() in "aeiou" else "a",
+                )
+                for name in names
+            ]
+        except (KeyError, ValueError) as error:
+            raise ValueError(
+                "geometric prompt suffix must be a valid template with {article} and {category}"
+            ) from error
+        tokenized_suffix = self.tokenizer(suffixes).long()
+        if tokenized_suffix.ndim == 1:
+            tokenized_suffix = tokenized_suffix.unsqueeze(0)
+        tokenized_suffix = tokenized_suffix.to(context.device)
+        with torch.no_grad():
+            embedded = clip_model.token_embedding(tokenized_suffix).to(context.dtype)
+
+        sequence_length = tokenized_suffix.shape[1]
         suffix_length = sequence_length - 1 - context_length
         if suffix_length <= 0:
             raise ValueError("Learnable tokens leave no room for the fixed suffix")
-        prefix = self.prefix_embedding.to(context.device).expand(prompt_count, -1, -1)
-        suffix = self.suffix_embedding[:, :suffix_length].to(context.device).expand(
-            prompt_count, -1, -1
-        )
+        prefix = embedded[:, :1]
+        suffix = embedded[:, 1 : 1 + suffix_length]
         prompts = torch.cat((prefix, context, suffix), dim=1)
-        base = self.base_tokenized.to(context.device).expand(prompt_count, -1)
-        tokenized = torch.zeros_like(base)
-        tokenized[:, :1] = base[:, :1]
-        tokenized[:, 1 + context_length :] = base[:, 1 : 1 + suffix_length]
+
+        # Move category-conditioned suffix tokens and EOT after the learnable context.
+        tokenized = torch.zeros_like(tokenized_suffix)
+        tokenized[:, :1] = tokenized_suffix[:, :1]
+        tokenized[:, 1 + context_length :] = tokenized_suffix[:, 1 : 1 + suffix_length]
         return prompts, tokenized
 
-    def normal_prompt(self):
-        return self._assemble(self.normal_tokens.unsqueeze(0))
+    def normal_prompt(self, clip_model, object_names=None):
+        names = self._normalize_object_names(object_names)
+        context = self.normal_tokens.unsqueeze(0).expand(len(names), -1, -1)
+        return self._assemble(context, clip_model, names)
 
-    def abnormal_prompts(self, prior=None):
-        shared = self.normal_tokens.unsqueeze(0).expand(self.num_abnormal_prompts, -1, -1)
-        abnormal = self.abnormal_tokens
-        if prior is None:
-            context = torch.cat((shared, abnormal), dim=1)
-            return self._assemble(context)
-        if prior.ndim != 2 or prior.shape[1] != self.token_width:
-            raise ValueError(
-                f"prior must be [B, {self.token_width}], got {tuple(prior.shape)}"
-            )
-        batch_size = prior.shape[0]
-        shared = shared.unsqueeze(0).expand(batch_size, -1, -1, -1)
-        abnormal = abnormal.unsqueeze(0).expand(batch_size, -1, -1, -1)
-        abnormal = abnormal + prior[:, None, None, :]
+    def abnormal_prompts(self, clip_model, object_names=None, prior=None):
+        if prior is not None:
+            if prior.ndim != 2 or prior.shape[1] != self.token_width:
+                raise ValueError(
+                    f"prior must be [B, {self.token_width}], got {tuple(prior.shape)}"
+                )
+            names = self._normalize_object_names(object_names, prior.shape[0])
+        else:
+            names = self._normalize_object_names(object_names)
+
+        batch_size = len(names)
+        shared = self.normal_tokens[None, None].expand(
+            batch_size, self.num_abnormal_prompts, -1, -1
+        )
+        abnormal = self.abnormal_tokens.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        if prior is not None:
+            abnormal = abnormal + prior[:, None, None, :]
         context = torch.cat((shared, abnormal), dim=2).reshape(
             batch_size * self.num_abnormal_prompts,
             self.num_normal_tokens + self.num_abnormal_tokens,
             self.token_width,
         )
-        return self._assemble(context)
+        repeated_names = [name for name in names for _ in range(self.num_abnormal_prompts)]
+        return self._assemble(context, clip_model, repeated_names)
 
 
 def _encode_prompt_embeddings(clip_model, prompt_embeddings, tokenized_prompts):
@@ -117,40 +153,70 @@ def _encode_prompt_embeddings(clip_model, prompt_embeddings, tokenized_prompts):
     return F.normalize(x.float(), dim=-1)
 
 
-def encode_geometric_prompts(prompt_learner, clip_model, prior=None):
-    normal_prompt, normal_tokens = prompt_learner.normal_prompt()
-    abnormal_prompt, abnormal_tokens = prompt_learner.abnormal_prompts()
+def encode_prior_enabled_abnormal_prompts(
+    prompt_learner, clip_model, prior, object_names=None
+):
+    """Encode only prior-conditioned abnormal prompts, without base recomputation."""
+    if prior is None:
+        raise ValueError("prior is required for dynamic abnormal prompts")
+    names = prompt_learner._normalize_object_names(object_names, prior.shape[0])
+    batch_size = len(names)
+    dynamic_prompt, dynamic_tokens = prompt_learner.abnormal_prompts(
+        clip_model, names, prior
+    )
+    dynamic = _encode_prompt_embeddings(
+        clip_model, dynamic_prompt, dynamic_tokens
+    ).reshape(batch_size, prompt_learner.num_abnormal_prompts, -1)
+    return {
+        "prior_enabled_abnormal_text_embeds": dynamic,
+        "prior_enabled_abnormal_text_proto": F.normalize(
+            dynamic.mean(dim=1), dim=-1
+        ),
+    }
+
+
+def encode_geometric_prompts(
+    prompt_learner, clip_model, prior=None, object_names=None
+):
+    """Encode category-conditioned prompts as [B,D], [B,K,D], and [B,D]."""
+    if prior is not None:
+        names = prompt_learner._normalize_object_names(object_names, prior.shape[0])
+    else:
+        names = prompt_learner._normalize_object_names(object_names)
+    batch_size = len(names)
+
+    normal_prompt, normal_tokens = prompt_learner.normal_prompt(clip_model, names)
+    abnormal_prompt, abnormal_tokens = prompt_learner.abnormal_prompts(clip_model, names)
     normal_embedding = _encode_prompt_embeddings(clip_model, normal_prompt, normal_tokens)
     abnormal_embeddings = _encode_prompt_embeddings(
         clip_model, abnormal_prompt, abnormal_tokens
-    )
+    ).reshape(batch_size, prompt_learner.num_abnormal_prompts, -1)
     outputs = {
         "normal_text_embed": normal_embedding,
         "abnormal_text_embeds": abnormal_embeddings,
-        "abnormal_text_proto": F.normalize(abnormal_embeddings.mean(dim=0), dim=-1),
+        "abnormal_text_proto": F.normalize(abnormal_embeddings.mean(dim=1), dim=-1),
         "prior_enabled_abnormal_text_embeds": None,
         "prior_enabled_abnormal_text_proto": None,
     }
     if prior is not None:
-        dynamic_prompt, dynamic_tokens = prompt_learner.abnormal_prompts(prior)
-        dynamic = _encode_prompt_embeddings(clip_model, dynamic_prompt, dynamic_tokens)
-        dynamic = dynamic.reshape(
-            prior.shape[0], prompt_learner.num_abnormal_prompts, -1
-        )
-        outputs["prior_enabled_abnormal_text_embeds"] = dynamic
-        outputs["prior_enabled_abnormal_text_proto"] = F.normalize(
-            dynamic.mean(dim=1), dim=-1
+        outputs.update(
+            encode_prior_enabled_abnormal_prompts(
+                prompt_learner, clip_model, prior, object_names=names
+            )
         )
     return outputs
 
 
 def abnormal_prompt_orthogonal_loss(abnormal_embeddings):
-    if abnormal_embeddings.shape[-2] <= 1:
+    prompt_count = abnormal_embeddings.shape[-2]
+    if prompt_count <= 1:
         return abnormal_embeddings.sum() * 0.0
     embeddings = F.normalize(abnormal_embeddings, dim=-1)
     gram = embeddings @ embeddings.transpose(-1, -2)
-    identity = torch.eye(gram.shape[-1], device=gram.device, dtype=gram.dtype)
-    return ((gram - identity) ** 2).sum() / (gram.numel() - gram.shape[-1])
+    identity = torch.eye(prompt_count, device=gram.device, dtype=gram.dtype)
+    batch_factor = gram.numel() // (prompt_count * prompt_count)
+    off_diagonal_count = batch_factor * prompt_count * (prompt_count - 1)
+    return ((gram - identity) ** 2).sum() / off_diagonal_count
 
 
 def geometric_anomaly_logits(

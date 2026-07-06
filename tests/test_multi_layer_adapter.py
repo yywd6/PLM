@@ -1,6 +1,10 @@
 import torch
 
-from models.trainable_baseline import MultiLayerPatchAdapter, select_multi_layer_tokens
+from models.trainable_baseline import (
+    MultiLayerPatchAdapter,
+    aggregate_object_probability,
+    select_multi_layer_tokens,
+)
 
 
 def test_all_four_layers_are_projected_and_fused():
@@ -21,3 +25,24 @@ def test_layer_weight_receives_gradient():
     output[..., 0].sum().backward()
     assert adapter.layer_logits.grad is not None
     assert torch.isfinite(adapter.layer_logits.grad).all()
+
+
+def test_object_probability_combines_global_and_top_patch_probabilities():
+    global_logits = torch.tensor([0.0, 2.0])
+    patch_logits = torch.tensor([[0.0, 1.0, 2.0, 3.0], [-1.0, 0.0, 1.0, 2.0]])
+    actual = aggregate_object_probability(
+        global_logits, patch_logits, global_alpha=0.5, top_percent=0.5
+    )
+    local = torch.topk(torch.sigmoid(patch_logits.double()), k=2, dim=1).values.mean(dim=1)
+    expected = 0.5 * torch.sigmoid(global_logits.double()) + 0.5 * local
+    assert actual.dtype == torch.float64
+    assert torch.allclose(actual, expected)
+
+
+def test_object_probability_avoids_float32_sigmoid_ties():
+    global_logits = torch.zeros(2)
+    patch_logits = torch.tensor([[20.0], [19.0]])
+    scores = aggregate_object_probability(
+        global_logits, patch_logits, global_alpha=0.0, top_percent=1.0
+    )
+    assert scores[0] > scores[1]

@@ -28,6 +28,7 @@ normal_templates:
 anomaly_templates:
   - a 3D point cloud of a defective object
 temperature: 0.07
+global_alpha: 0.0
 top_percent: 0.2
 
 epochs: 10
