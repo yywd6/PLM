@@ -1,8 +1,9 @@
-"""Train the linear baseline or prompt-only 3D geometric CAP/DAP."""
+"""Two-stage training for the visual baseline and static Prompt learning."""
 
 import argparse
 import math
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -13,37 +14,22 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Subset
 
 from data.anomaly_datasets import PointCloudDataset
+from evaluation_metrics import safe_binary_metrics
 from loss import BinaryDiceLoss, BinaryFocalLoss
-from models.geometric_cap import (
-    GeometricCompoundPromptLearner,
-    abnormal_prompt_orthogonal_loss,
-    encode_geometric_prompts,
-    encode_prior_enabled_abnormal_prompts,
-    geometric_anomaly_logits,
-)
-from models.geometric_dap import (
-    PointCloudAbnormalityPrior,
-    geometric_prior_invariance_loss,
-    random_se3_transform,
-    normal_sample_prior_loss,
-)
-from models.geometric_mode_graph import random_se3_transform as random_mode_se3_transform
-from models.geometric_mode_prompt import (
-    GeometricModePromptLearner,
-    encode_geometric_mode_prompts,
+from models.static_prompt import (
+    StaticPromptLearner,
+    forward_static_prompt_scores,
     format_category_prompt,
-    geometry_gate_supervision_loss,
-    mode_aware_anomaly_logits,
-    mode_diversity_loss,
-    mode_entropy_regularization,
-    normalized_mode_entropy,
     point_mask_to_patch_targets,
-    residual_suppression_loss,
-    se3_sanity_loss,
-    sinkhorn_mode_assignment_loss,
+    prompt_diversity_loss,
+)
+from models.normal_centered_residual_prompt import (
+    NormalCenteredResidualPromptLearner,
+    forward_ncrp_k1_scores,
 )
 from models.trainable_baseline import (
     MultiLayerPatchAdapter,
+    configurable_object_probability,
     patch_text_logits,
     patch_to_point,
     aggregate_object_probability,
@@ -51,16 +37,22 @@ from models.trainable_baseline import (
 )
 from models.ulip2_encoder import ULIP2Encoder
 from one_rest_protocol import (
+    assert_no_forbidden_config_keys,
     assert_dataset_categories,
+    category_run_name,
+    checkpoint_train_categories,
     load_yaml,
     log_line,
+    normalize_train_categories,
     resolve_categories,
     validate_one_rest_flags,
     write_yaml,
 )
+from utils.residual_prompt_config import flatten_residual_prompt_config
+from utils.reproducibility import dataloader_seed_kwargs, seed_everything
 
 
-DEFAULT_CONFIG = "configs/trainable_baseline.yaml"
+DEFAULT_CONFIG = "configs/two_rest_static_six_prompt_v1_uniform_scoring.yaml"
 
 
 def str2bool(value):
@@ -74,11 +66,14 @@ def str2bool(value):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Train ULIP patch baseline or 3D-CAP/DAP.")
+    parser = argparse.ArgumentParser(
+        description="Train the stage-1 visual baseline or stage-2 static Prompts."
+    )
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--protocol", choices=("baseline", "one_rest"), default="baseline")
     parser.add_argument("--train_category")
     parser.add_argument("--train_class", dest="train_category")
+    parser.add_argument("--train_categories", nargs="+")
     parser.add_argument("--dataset_name", choices=tuple(PointCloudDataset.PRESETS), default="Real3D")
     parser.add_argument("--data_root")
     parser.add_argument("--model_path")
@@ -101,11 +96,13 @@ def build_parser():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--prompt_learning_rate", type=float, default=1e-3)
-    parser.add_argument("--prior_learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--warmup_ratio", type=float, default=0.0)
     parser.add_argument("--minimum_learning_rate", type=float, default=1e-6)
     parser.add_argument("--gradient_clip_norm", type=float, default=0.0)
+    parser.add_argument("--validation_fraction", type=float, default=0.0)
+    parser.add_argument("--validation_interval", type=int, default=1)
+    parser.add_argument("--checkpoint_metric", choices=("loss", "val_object_auroc"), default="loss")
     parser.add_argument("--focal_weight", type=float, default=1.0)
     parser.add_argument("--dice_weight", type=float, default=1.0)
     parser.add_argument("--object_weight", type=float, default=0.5)
@@ -120,56 +117,49 @@ def build_parser():
     parser.add_argument("--use_target_anomaly_for_training", type=str2bool, default=False)
     parser.add_argument("--save_per_category_metrics", type=str2bool, default=True)
     parser.add_argument("--save_mean_metrics", type=str2bool, default=True)
-    parser.add_argument("--use_geometric_cap", type=str2bool, default=False)
-    parser.add_argument("--use_geometric_dap", type=str2bool, default=False)
-    parser.add_argument("--num_geometric_abnormal_prompts", type=int, default=10)
     parser.add_argument("--num_normal_tokens", type=int, default=4)
     parser.add_argument("--num_abnormal_tokens", type=int, default=4)
-    parser.add_argument("--geometric_prompt_suffix", default="a point cloud patch of {article} {category}")
-    parser.add_argument("--top_m_abnormal_patches", type=int, default=10)
-    parser.add_argument("--prior_hidden_dim", type=int, default=512)
-    parser.add_argument("--patch_geo_desc_dim", type=int, default=4)
-    parser.add_argument("--geometry_graph_dim", type=int, default=128)
-    parser.add_argument("--geometry_graph_k", type=int, default=8)
-    parser.add_argument("--geometry_graph_layers", type=int, default=2)
-    parser.add_argument("--geometry_routing_temperature", type=float, default=0.2)
-    parser.add_argument("--use_geometric_mode_prompt", type=str2bool, default=False)
+    parser.add_argument("--use_static_prompt", type=str2bool, default=False)
     parser.add_argument("--use_category_prompt", type=str2bool, default=True)
     parser.add_argument("--prompt_template", default="a point cloud patch of a {category}")
-    parser.add_argument("--num_geometric_modes", type=int, default=10)
-    parser.add_argument("--mode_router_temperature", type=float, default=0.2)
-    parser.add_argument("--mode_score_type", choices=("weighted_sum", "logsumexp", "max"), default="weighted_sum")
-    parser.add_argument("--mode_score_temperature", type=float, default=0.1)
-    parser.add_argument("--mode_residual_scale", type=float, default=0.1)
-    parser.add_argument("--mode_prompt_hidden_dim", type=int, default=512)
-    parser.add_argument("--use_mode_specific_residual", type=str2bool, default=True)
-    parser.add_argument("--use_mode_weighted_scoring", type=str2bool, default=True)
-    parser.add_argument("--use_patch_mode_routing", type=str2bool, default=True)
-    parser.add_argument("--mode_anomaly_patch_threshold", type=float, default=0.05)
-    parser.add_argument("--geometric_mode_version", default="se3_mode_prompt_v7_gate_sinkhorn")
-    parser.add_argument("--use_geometry_abnormal_gate", type=str2bool, default=False)
-    parser.add_argument("--geometry_gate_logit_scale", type=float, default=1.0)
-    parser.add_argument("--lambda_geometry_gate", type=float, default=0.2)
-    parser.add_argument("--geometry_gate_margin", type=float, default=0.5)
-    parser.add_argument("--use_sinkhorn_mode_assignment", type=str2bool, default=False)
-    parser.add_argument("--lambda_mode_assignment", type=float, default=0.05)
-    parser.add_argument("--sinkhorn_epsilon", type=float, default=0.05)
-    parser.add_argument("--sinkhorn_iterations", type=int, default=3)
-    parser.add_argument("--use_mode_diversity_loss", type=str2bool, default=True)
-    parser.add_argument("--use_mode_entropy_loss", type=str2bool, default=True)
-    parser.add_argument("--use_residual_suppression_loss", type=str2bool, default=True)
-    parser.add_argument("--lambda_mode_diversity", type=float, default=0.05)
-    parser.add_argument("--lambda_mode_entropy", type=float, default=0.05)
-    parser.add_argument("--mode_conditional_entropy_weight", type=float, default=0.5)
-    parser.add_argument("--lambda_residual_suppression", type=float, default=0.1)
-    parser.add_argument("--lambda_se3_sanity", type=float, default=0.0)
-    parser.add_argument("--lambda_geometry_invariance", type=float, default=0.1)
-    parser.add_argument("--lambda_prompt_orthogonal", type=float, default=0.1)
-    parser.add_argument("--lambda_prior", type=float, default=0.1)
+    parser.add_argument("--num_abnormal_prompts", type=int, default=6)
+    parser.add_argument("--prompt_score_temperature", type=float, default=0.07)
+    parser.add_argument("--static_prompt_version", default="static_six_prompt_v1")
+    parser.add_argument("--use_prompt_diversity_loss", type=str2bool, default=True)
+    parser.add_argument("--lambda_prompt_diversity", type=float, default=0.01)
+    parser.add_argument("--residual_prompt_enabled", type=str2bool, default=False)
+    parser.add_argument("--residual_num_bases", type=int, default=1)
+    parser.add_argument("--residual_gamma", type=float, default=1.0)
+    parser.add_argument("--residual_eps", type=float, default=1e-6)
+    parser.add_argument("--patch_anomaly_threshold", type=float, default=0.05)
+    parser.add_argument(
+        "--object_pooling_mode",
+        choices=("legacy", "top_mean", "top_max", "global_patch_fusion"),
+        default="legacy",
+    )
+    parser.add_argument("--object_top_ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--source_validation_top_ratios",
+        type=float,
+        nargs="+",
+        default=[0.005, 0.01, 0.05, 0.2],
+    )
     parser.add_argument("--freeze_plm", type=str2bool, default=True)
     parser.add_argument("--freeze_text_encoder", type=str2bool, default=True)
     parser.add_argument("--freeze_visual_adapter", type=str2bool, default=True)
+    parser.add_argument(
+        "--visual_adapter_training_mode",
+        choices=("fused_only",),
+        default="fused_only",
+    )
+    parser.add_argument(
+        "--required_visual_adapter_training_mode",
+        choices=("any", "fused_only"),
+        default="any",
+    )
     parser.add_argument("--baseline_checkpoint")
+    parser.add_argument("--prompt_checkpoint")
+    parser.add_argument("--resume_checkpoint")
     return parser
 
 
@@ -177,7 +167,8 @@ def parse_args():
     first = argparse.ArgumentParser(add_help=False)
     first.add_argument("--config", default=DEFAULT_CONFIG)
     config_args, _ = first.parse_known_args()
-    config = load_yaml(config_args.config)
+    config = flatten_residual_prompt_config(load_yaml(config_args.config))
+    assert_no_forbidden_config_keys(config, config_args.config)
     parser = build_parser()
     valid = {action.dest for action in parser._actions}
     unknown = sorted(set(config) - valid)
@@ -185,35 +176,341 @@ def parse_args():
         raise ValueError(f"Unknown config keys: {unknown}")
     parser.set_defaults(**config)
     args = parser.parse_args()
-    if not args.train_category:
-        parser.error("--train_category is required")
-    missing_layers = [layer for layer in args.feature_layers if layer not in args.return_layers]
+    try:
+        args.train_categories = normalize_train_categories(
+            args.dataset_name, args.train_category, args.train_categories
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    args.train_category = category_run_name(args.train_categories)
+    missing_layers = [
+        layer for layer in args.feature_layers if layer not in args.return_layers
+    ]
     if missing_layers:
-        parser.error(f"feature_layers must be included in return_layers: {missing_layers}")
-    if args.use_geometric_dap and not args.use_geometric_cap:
-        parser.error("use_geometric_dap requires use_geometric_cap=true")
-    if args.use_geometric_mode_prompt and (args.use_geometric_cap or args.use_geometric_dap):
-        parser.error("geometric mode prompting is independent of the legacy CAP/DAP path")
-    if args.use_geometric_mode_prompt and not (args.freeze_plm and args.freeze_text_encoder):
-        parser.error("geometric mode prompting requires frozen PLM and text encoder")
-    if args.use_geometric_cap and not (args.freeze_plm and args.freeze_text_encoder):
-        parser.error("3D-CAP requires freeze_plm=true and freeze_text_encoder=true")
+        parser.error(
+            f"feature_layers must be included in return_layers: {missing_layers}"
+        )
+    if args.num_abnormal_prompts <= 0:
+        parser.error("num_abnormal_prompts must be positive")
+    if args.prompt_score_temperature <= 0:
+        parser.error("prompt_score_temperature must be positive")
+    if args.residual_prompt_enabled:
+        if not args.use_static_prompt:
+            parser.error("NCRP requires the frozen text Prompt training path")
+        if args.residual_num_bases != 1:
+            parser.error("NCRP-K1 requires exactly one residual vector")
+        if args.use_prompt_diversity_loss:
+            parser.error("NCRP-K1 does not use Prompt diversity loss")
+        if args.object_pooling_mode != "top_mean" or args.object_top_ratio != 0.2:
+            parser.error("NCRP v1 fixes object pooling to top_mean with ratio 0.2")
+        if args.global_alpha != 0.0:
+            parser.error("NCRP v1 fixes global_alpha=0")
+    if args.residual_eps <= 0 or args.residual_gamma < 0:
+        parser.error("NCRP gamma must be non-negative and eps positive")
+    if not 0 <= args.patch_anomaly_threshold <= 1:
+        parser.error("patch_anomaly_threshold must be in [0, 1]")
+    if not 0 < args.object_top_ratio <= 1:
+        parser.error("object_top_ratio must be in (0, 1]")
+    if not args.source_validation_top_ratios or any(
+        not 0 < value <= 1 for value in args.source_validation_top_ratios
+    ):
+        parser.error("source_validation_top_ratios must be in (0, 1]")
+    if args.use_static_prompt and not (
+        args.freeze_plm and args.freeze_text_encoder
+    ):
+        parser.error("Prompt learning requires frozen PLM and text encoder")
     if not 0.0 <= args.warmup_ratio < 1.0:
         parser.error("warmup_ratio must be in [0, 1)")
+    if args.use_static_prompt and (
+        args.visual_adapter_training_mode != "fused_only"
+    ):
+        parser.error(
+            "visual_adapter_training_mode applies only to stage-1 visual training"
+        )
     if args.minimum_learning_rate < 0 or args.gradient_clip_norm < 0:
-        parser.error("minimum_learning_rate and gradient_clip_norm must be non-negative")
-    if args.use_sinkhorn_mode_assignment and not args.use_geometric_mode_prompt:
-        parser.error("Sinkhorn mode assignment requires geometric mode prompting")
+        parser.error(
+            "minimum_learning_rate and gradient_clip_norm must be non-negative"
+        )
+    if not 0 <= args.validation_fraction < 1:
+        parser.error("validation_fraction must be in [0, 1)")
+    if args.validation_interval <= 0:
+        parser.error("validation_interval must be positive")
+    if (
+        args.checkpoint_metric == "val_object_auroc"
+        and args.validation_fraction <= 0
+    ):
+        parser.error(
+            "checkpoint_metric=val_object_auroc requires validation_fraction > 0"
+        )
     validate_one_rest_flags(args)
     return args
 
 
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def set_seed(seed, num_workers=0):
+    return seed_everything(seed, num_workers=num_workers)
 
+
+
+def stratified_holdout_indices(dataset, candidate_indices, fraction, seed):
+    if fraction <= 0 or len(candidate_indices) < 2:
+        return list(candidate_indices), []
+    rng = random.Random(seed)
+    grouped = {0: [], 1: []}
+    for idx in candidate_indices:
+        sample = dataset[idx]
+        label = int(sample["labels"].max().item() > 0)
+        grouped[label].append(idx)
+    train_indices, val_indices = [], []
+    for group in grouped.values():
+        if not group:
+            continue
+        rng.shuffle(group)
+        if len(group) == 1:
+            train_indices.extend(group)
+            continue
+        val_count = max(1, int(round(len(group) * fraction)))
+        val_count = min(val_count, len(group) - 1)
+        val_indices.extend(group[:val_count])
+        train_indices.extend(group[val_count:])
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    if not train_indices or not val_indices:
+        return list(candidate_indices), []
+    return train_indices, val_indices
+
+
+def build_checkpoint_state(
+    args, adapter, prompt_model, epoch, loss, selection_metric, selection_value
+):
+    state = {
+        "adapter": adapter.state_dict(),
+        "train_category": args.train_category,
+        "train_categories": list(args.train_categories),
+        "feature_layers": list(args.feature_layers),
+        "token_dim": args.token_dim,
+        "text_dim": args.text_dim,
+        "epoch": epoch,
+        "loss": float(loss),
+        "selection_metric": selection_metric,
+        "selection_value": float(selection_value),
+        "checkpoint_metric": args.checkpoint_metric,
+        "seed": args.seed,
+        "seed_report": getattr(args, "seed_report", None),
+        "training_time_seconds": (
+            getattr(args, "training_time_offset", 0.0)
+            + time.perf_counter() - args.training_started
+            if hasattr(args, "training_started")
+            else None
+        ),
+        "validation_fraction": args.validation_fraction,
+        "validation_interval": args.validation_interval,
+        "prompt_checkpoint": args.prompt_checkpoint,
+        "use_static_prompt": args.use_static_prompt,
+        "static_prompt_version": (
+            args.static_prompt_version if args.use_static_prompt else None
+        ),
+        "num_abnormal_prompts": (
+            args.num_abnormal_prompts if args.use_static_prompt else None
+        ),
+        "prompt_template": (
+            args.prompt_template if args.use_static_prompt else None
+        ),
+        "use_category_prompt": (
+            args.use_category_prompt if args.use_static_prompt else None
+        ),
+        "prompt_score_temperature": (
+            args.prompt_score_temperature if args.use_static_prompt else None
+        ),
+        "patch_anomaly_threshold": args.patch_anomaly_threshold,
+        "object_pooling_mode": args.object_pooling_mode,
+        "object_top_ratio": args.object_top_ratio,
+        "source_validation_top_ratios": list(args.source_validation_top_ratios),
+        "visual_adapter_training_mode": args.visual_adapter_training_mode,
+        "required_visual_adapter_training_mode": (
+            args.required_visual_adapter_training_mode
+        ),
+        "visual_source_training_mode": getattr(
+            args, "visual_source_training_mode", None
+        ),
+        "residual_prompt_enabled": args.residual_prompt_enabled,
+        "residual_num_bases": args.residual_num_bases,
+        "residual_gamma": args.residual_gamma,
+        "residual_eps": args.residual_eps,
+    }
+    if prompt_model is not None:
+        state[
+            "residual_prompt" if args.residual_prompt_enabled else "static_prompt"
+        ] = prompt_model.state_dict()
+    return state
+
+
+def forward_prompt_scores(
+    args,
+    adapter,
+    layer_tokens,
+    global_embeddings,
+    prompt_model,
+    clip_model,
+    object_names,
+):
+    """Route the two maintained Prompt methods: NCRP-K1 and Static."""
+    if args.residual_prompt_enabled:
+        return forward_ncrp_k1_scores(
+            adapter,
+            layer_tokens,
+            global_embeddings,
+            prompt_model,
+            clip_model,
+            object_names,
+            temperature=args.temperature,
+        )
+    return forward_static_prompt_scores(
+        adapter,
+        layer_tokens,
+        global_embeddings,
+        prompt_model,
+        clip_model,
+        object_names,
+        temperature=args.temperature,
+        prompt_score_temperature=args.prompt_score_temperature,
+    )
+
+
+def pool_training_object_probability(args, global_logits, patch_logits):
+    if args.object_pooling_mode == "legacy":
+        return aggregate_object_probability(
+            global_logits, patch_logits, args.global_alpha, args.top_percent
+        )
+    return configurable_object_probability(
+        global_logits,
+        torch.sigmoid(patch_logits.double()),
+        args.object_pooling_mode,
+        args.object_top_ratio,
+        args.global_alpha,
+    )
+
+
+def prompt_parameter_counts(prompt_model):
+    if isinstance(prompt_model, NormalCenteredResidualPromptLearner):
+        bank = prompt_model.prompt_bank
+        counts = {
+            "normal_prompt_tokens": bank.normal_tokens.numel(),
+            "local_residual_basis": bank.local_residual_basis.numel(),
+            "abnormal_prompt_tokens": 0,
+        }
+        counts["total"] = sum(counts.values())
+        return counts
+    counts = {
+        "prompt_tokens": sum(
+            parameter.numel()
+            for parameter in prompt_model.prompt_bank.parameters()
+        ),
+    }
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+@torch.no_grad()
+def evaluate_holdout_object_metrics(
+    args, loader, encoder, adapter, prompt_model, fixed_normal, fixed_anomaly, device
+):
+    adapter_was_training = adapter.training
+    prompt_was_training = (
+        prompt_model.training if prompt_model is not None else False
+    )
+    adapter.eval()
+    if prompt_model is not None:
+        prompt_model.eval()
+    labels_all, scores_all = [], []
+    ratio_scores = {
+        float(ratio): [] for ratio in args.source_validation_top_ratios
+    }
+    for batch in loader:
+        points = batch["points"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
+        object_labels = (labels > 0).any(dim=1).float()
+        features = encoder.encode_pointcloud(points, return_intermediate=True)
+        tokens = select_multi_layer_tokens(
+            features["layer_feats"], features["patch_idx"], args.feature_layers
+        )
+        if prompt_model is not None:
+            category_names = PointCloudDataset.PRESETS[args.dataset_name]
+            object_names = [
+                category_names[int(category)] for category in batch["category"]
+            ]
+            score_output = forward_prompt_scores(
+                args,
+                adapter,
+                tokens,
+                features["concat"],
+                prompt_model,
+                encoder.open_clip_model,
+                object_names,
+            )
+            patch_logits = score_output["patch_logits"]
+            global_logits = score_output["global_logits"]
+        else:
+            patch_embeddings = adapter(tokens)
+            patch_logits = patch_text_logits(
+                patch_embeddings, fixed_normal, fixed_anomaly, args.temperature
+            )
+            global_logits = patch_text_logits(
+                features["concat"].unsqueeze(1),
+                fixed_normal,
+                fixed_anomaly,
+                args.temperature,
+            ).squeeze(1)
+        object_probability = pool_training_object_probability(
+            args, global_logits, patch_logits
+        )
+        labels_all.extend(object_labels.detach().cpu().tolist())
+        scores_all.extend(object_probability.detach().cpu().tolist())
+        if args.object_pooling_mode != "legacy":
+            patch_probabilities = torch.sigmoid(patch_logits.double())
+            for ratio, collected in ratio_scores.items():
+                candidate_probability = configurable_object_probability(
+                    global_logits,
+                    patch_probabilities,
+                    args.object_pooling_mode,
+                    ratio,
+                    args.global_alpha,
+                )
+                collected.extend(candidate_probability.detach().cpu().tolist())
+    metrics = safe_binary_metrics(labels_all, scores_all)
+    adapter.train(adapter_was_training)
+    if prompt_model is not None:
+        prompt_model.train(prompt_was_training)
+    result = {
+        "val_object_auroc": float(metrics["auroc"]),
+        "val_object_ap": float(metrics["ap"]),
+        "val_samples": len(labels_all),
+    }
+    if args.object_pooling_mode != "legacy":
+        ratio_metrics = {}
+        for ratio, candidate_scores in ratio_scores.items():
+            candidate_metrics = safe_binary_metrics(labels_all, candidate_scores)
+            ratio_metrics[f"{ratio:g}"] = {
+                "object_auroc": float(candidate_metrics["auroc"]),
+                "object_ap": float(candidate_metrics["ap"]),
+            }
+        def source_ratio_key(ratio):
+            item = ratio_metrics[f"{float(ratio):g}"]
+            auroc = item["object_auroc"]
+            average_precision = item["object_ap"]
+            return (
+                auroc if np.isfinite(auroc) else float("-inf"),
+                average_precision
+                if np.isfinite(average_precision)
+                else float("-inf"),
+                -args.source_validation_top_ratios.index(ratio),
+            )
+
+        selected_ratio = max(
+            args.source_validation_top_ratios, key=source_ratio_key
+        )
+        result["source_top_ratio_metrics"] = ratio_metrics
+        result["source_selected_top_ratio"] = float(selected_ratio)
+    return result
 
 
 def build_warmup_cosine_scheduler(optimizer, total_steps, warmup_ratio, minimum_lr):
@@ -234,80 +531,120 @@ def build_warmup_cosine_scheduler(optimizer, total_steps, warmup_ratio, minimum_
     return LambdaLR(optimizer, lr_factor)
 
 
-def build_cap_modules(args, encoder, adapter, device):
-    if not args.use_geometric_cap:
-        return None, None
-    if args.freeze_visual_adapter:
-        if not args.baseline_checkpoint:
-            raise ValueError(
-                "baseline_checkpoint is required when freeze_visual_adapter=true"
+def topk_mean_logits(patch_logits, top_percent):
+    if not 0 < top_percent <= 1:
+        raise ValueError("top_percent must be in (0, 1]")
+    count = max(1, int(patch_logits.shape[1] * top_percent))
+    return patch_logits.topk(count, dim=1).values.mean(dim=1)
+
+
+LEGACY_STATIC_PROMPT_VERSION = "static_six_mode_prompt_v7_uniform_scoring"
+LEGACY_NCRP_K1_VERSION = "ncrp_a1_k1_single_residual"
+
+
+def checkpoint_uses_static_prompt(checkpoint):
+    """Recognize current checkpoints and the completed legacy static run."""
+    if "use_static_prompt" in checkpoint:
+        return bool(checkpoint["use_static_prompt"])
+    return (
+        checkpoint.get("geometric_mode_version")
+        == LEGACY_STATIC_PROMPT_VERSION
+    )
+
+
+def checkpoint_static_prompt_state(checkpoint):
+    if "residual_prompt" in checkpoint:
+        return checkpoint["residual_prompt"]
+    if "static_prompt" in checkpoint:
+        return checkpoint["static_prompt"]
+    if "geometric_mode_prompt" in checkpoint:
+        return checkpoint["geometric_mode_prompt"]
+    raise RuntimeError("Checkpoint does not contain static Prompt weights")
+
+
+def checkpoint_visual_adapter_training_mode(checkpoint):
+    """Read new metadata while treating every legacy checkpoint as fused-only."""
+    return (
+        checkpoint.get("visual_source_training_mode")
+        or checkpoint.get("visual_adapter_training_mode")
+        or "fused_only"
+    )
+
+
+def validate_visual_adapter_training_mode(args, checkpoint, checkpoint_path):
+    mode = checkpoint_visual_adapter_training_mode(checkpoint)
+    required = args.required_visual_adapter_training_mode
+    if required != "any" and mode != required:
+        raise RuntimeError(
+            "Visual adapter training mode mismatch: "
+            f"required={required}, checkpoint={mode}, path={checkpoint_path}"
+        )
+    args.visual_source_training_mode = mode
+
+
+def build_static_prompt_model(args, encoder, adapter, device):
+    if not args.use_static_prompt:
+        return None
+
+    prompt_checkpoint = None
+    prompt_checkpoint_argument = args.resume_checkpoint or args.prompt_checkpoint
+    if prompt_checkpoint_argument:
+        prompt_path = Path(
+            prompt_checkpoint_argument.format(train_category=args.train_category)
+        )
+        if not prompt_path.is_file():
+            raise FileNotFoundError(
+                f"Prompt checkpoint not found: {prompt_path}"
             )
+        prompt_checkpoint = torch.load(
+            prompt_path, map_location=device, weights_only=False
+        )
+        if not checkpoint_uses_static_prompt(prompt_checkpoint):
+            raise RuntimeError("Prompt checkpoint does not use static Prompts")
+        if checkpoint_train_categories(prompt_checkpoint) != args.train_categories:
+            raise RuntimeError("Prompt checkpoint train_categories mismatch")
+        if list(prompt_checkpoint.get("feature_layers", [])) != list(
+            args.feature_layers
+        ):
+            raise RuntimeError("Prompt checkpoint feature_layers mismatch")
+        validate_visual_adapter_training_mode(
+            args, prompt_checkpoint, prompt_path
+        )
+        checkpoint_version = prompt_checkpoint.get(
+            "static_prompt_version",
+            prompt_checkpoint.get("geometric_mode_version"),
+        )
+        if checkpoint_version not in {
+            args.static_prompt_version,
+            LEGACY_STATIC_PROMPT_VERSION,
+            LEGACY_NCRP_K1_VERSION,
+        }:
+            raise RuntimeError("Prompt checkpoint version mismatch")
+        adapter.load_state_dict(prompt_checkpoint["adapter"])
+    elif args.baseline_checkpoint:
         baseline_path = Path(
             args.baseline_checkpoint.format(train_category=args.train_category)
         )
         if not baseline_path.is_file():
-            raise FileNotFoundError(f"Baseline checkpoint not found: {baseline_path}")
+            raise FileNotFoundError(
+                f"Baseline checkpoint not found: {baseline_path}"
+            )
         baseline = torch.load(
             baseline_path, map_location=device, weights_only=False
         )
-        if baseline.get("train_category") != args.train_category:
-            raise RuntimeError("Baseline checkpoint train_category mismatch")
-        if "feature_layers" not in baseline:
-            raise RuntimeError(
-                "Baseline checkpoint uses the old single-layer adapter; retrain it with feature_layers=[2,5,8,11]"
-            )
-        if list(baseline["feature_layers"]) != list(args.feature_layers):
-            raise RuntimeError(
-                "Baseline checkpoint feature_layers do not match the current config"
-            )
-        adapter.load_state_dict(baseline["adapter"])
-        adapter.eval()
-        for parameter in adapter.parameters():
-            parameter.requires_grad = False
-
-    clip_model = encoder.open_clip_model
-    clip_model.eval()
-    for parameter in clip_model.parameters():
-        parameter.requires_grad = False
-    prompt_learner = GeometricCompoundPromptLearner(
-        clip_model,
-        encoder.tokenizer,
-        args.num_geometric_abnormal_prompts,
-        args.num_normal_tokens,
-        args.num_abnormal_tokens,
-        args.geometric_prompt_suffix,
-    ).to(device)
-    prior_network = None
-    if args.use_geometric_dap:
-        prior_network = PointCloudAbnormalityPrior(
-            feature_dim=args.text_dim,
-            text_dim=args.text_dim,
-            prompt_token_dim=prompt_learner.token_width,
-            graph_dim=args.geometry_graph_dim,
-            hidden_dim=args.prior_hidden_dim,
-            graph_k=args.geometry_graph_k,
-            graph_layers=args.geometry_graph_layers,
-            routing_temperature=args.geometry_routing_temperature,
-            top_m=args.top_m_abnormal_patches,
-        ).to(device)
-    return prompt_learner, prior_network
-
-
-def build_geometric_mode_model(args, encoder, adapter, device):
-    if not args.use_geometric_mode_prompt:
-        return None
-    if args.freeze_visual_adapter:
-        if not args.baseline_checkpoint:
-            raise ValueError("baseline_checkpoint is required when freeze_visual_adapter=true")
-        baseline_path = Path(args.baseline_checkpoint.format(train_category=args.train_category))
-        if not baseline_path.is_file():
-            raise FileNotFoundError(f"Baseline checkpoint not found: {baseline_path}")
-        baseline = torch.load(baseline_path, map_location=device, weights_only=False)
-        if baseline.get("train_category") != args.train_category:
-            raise RuntimeError("Baseline checkpoint train_category mismatch")
+        if checkpoint_train_categories(baseline) != args.train_categories:
+            raise RuntimeError("Baseline checkpoint train_categories mismatch")
         if list(baseline.get("feature_layers", [])) != list(args.feature_layers):
             raise RuntimeError("Baseline checkpoint feature_layers mismatch")
+        validate_visual_adapter_training_mode(args, baseline, baseline_path)
         adapter.load_state_dict(baseline["adapter"])
+    elif args.freeze_visual_adapter:
+        raise ValueError(
+            "baseline_checkpoint or prompt_checkpoint is required "
+            "when freeze_visual_adapter=true"
+        )
+
+    if args.freeze_visual_adapter:
         adapter.eval()
         for parameter in adapter.parameters():
             parameter.requires_grad = False
@@ -315,512 +652,639 @@ def build_geometric_mode_model(args, encoder, adapter, device):
     clip_model.eval()
     for parameter in clip_model.parameters():
         parameter.requires_grad = False
-    return GeometricModePromptLearner(
-        clip_model=clip_model,
-        tokenizer=encoder.tokenizer,
-        num_modes=args.num_geometric_modes,
-        num_normal_tokens=args.num_normal_tokens,
-        num_abnormal_tokens=args.num_abnormal_tokens,
-        prompt_template=args.prompt_template,
-        use_category_prompt=args.use_category_prompt,
-        graph_dim=args.geometry_graph_dim,
-        graph_k=args.geometry_graph_k,
-        graph_layers=args.geometry_graph_layers,
-        router_temperature=args.mode_router_temperature,
-        residual_scale=args.mode_residual_scale,
-        modulator_hidden_dim=args.mode_prompt_hidden_dim,
-        use_mode_specific_residual=args.use_mode_specific_residual,
-    ).to(device)
-
+    common_kwargs = {
+        "clip_model": clip_model,
+        "tokenizer": encoder.tokenizer,
+        "num_prompts": args.num_abnormal_prompts,
+        "num_normal_tokens": args.num_normal_tokens,
+        "num_abnormal_tokens": args.num_abnormal_tokens,
+        "prompt_template": args.prompt_template,
+        "use_category_prompt": args.use_category_prompt,
+    }
+    if args.residual_prompt_enabled:
+        model = NormalCenteredResidualPromptLearner(
+            clip_model=clip_model,
+            tokenizer=encoder.tokenizer,
+            num_bases=args.residual_num_bases,
+            num_normal_tokens=args.num_normal_tokens,
+            prompt_template=args.prompt_template,
+            use_category_prompt=args.use_category_prompt,
+            gamma=args.residual_gamma,
+            eps=args.residual_eps,
+        ).to(device)
+    else:
+        model = StaticPromptLearner(**common_kwargs).to(device)
+    if prompt_checkpoint is not None:
+        model.load_state_dict(
+            checkpoint_static_prompt_state(prompt_checkpoint), strict=True
+        )
+    return model
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
+    training_started = time.perf_counter()
+    args.training_started = training_started
+    args.training_time_offset = 0.0
+    seed_report = set_seed(args.seed, args.num_workers)
+    args.seed_report = seed_report
     train_categories, test_categories = resolve_categories(
-        args.dataset_name, args.protocol, args.train_category
+        args.dataset_name, args.protocol, train_categories=args.train_categories
     )
     run_dir = Path(args.output_root) / args.train_category
     run_dir.mkdir(parents=True, exist_ok=True)
     train_log = run_dir / "train.log"
-    train_log.write_text("", encoding="utf-8")
+    if not args.resume_checkpoint or not train_log.is_file():
+        train_log.write_text("", encoding="utf-8")
+    else:
+        log_line(train_log, "--- resumed training process ---")
     resolved = vars(args).copy()
-    resolved.update(train_categories=train_categories, test_categories=test_categories)
+    resolved.update(
+        train_categories=train_categories,
+        test_categories=test_categories,
+        seed_report=seed_report,
+    )
     write_yaml(run_dir / "config.yaml", resolved)
     log_line(train_log, f"Protocol: {args.protocol}")
     log_line(train_log, f"Train categories: {train_categories}")
     log_line(train_log, f"Test categories: {test_categories}")
-    if args.use_geometric_mode_prompt:
-        log_line(train_log, "GeometricModePrompt=True")
-        train_prompt_text = format_category_prompt(
-            args.prompt_template, args.train_category, args.use_category_prompt
+    log_line(train_log, f"Seed report: {seed_report}")
+    if args.use_static_prompt:
+        log_line(
+            train_log,
+            f"Prompt learner={'NCRP-K1' if args.residual_prompt_enabled else 'Static'}",
         )
+        if args.residual_prompt_enabled:
+            log_line(
+                train_log,
+                "NCRP-K1 residual vectors=1"
+                f" | gamma={args.residual_gamma:g}",
+            )
+        else:
+            log_line(
+                train_log,
+                f"Learnable abnormal Prompts={args.num_abnormal_prompts}",
+            )
         log_line(train_log, f"Prompt template: {args.prompt_template}")
-        log_line(train_log, f"Train category prompt text: {train_prompt_text}")
+        for category in train_categories:
+            train_prompt_text = format_category_prompt(
+                args.prompt_template, category, args.use_category_prompt
+            )
+            log_line(train_log, f"Train category prompt text [{category}]: {train_prompt_text}")
     else:
         log_line(
             train_log,
-            f"Geometric CAP={args.use_geometric_cap}, DAP={args.use_geometric_dap}",
+            "Stage 1: trainable multi-layer visual adapter"
+            f" | mode={args.visual_adapter_training_mode}",
         )
 
-    dataset = PointCloudDataset(
+    source_dataset = PointCloudDataset(
         args.data_root, split=args.train_split, classes=train_categories,
         dataset_name=args.dataset_name,
     )
-    if len(dataset) == 0:
+    if len(source_dataset) == 0:
         raise FileNotFoundError("No source training samples")
-    observed = assert_dataset_categories(dataset, train_categories, test_categories)
+    observed = assert_dataset_categories(source_dataset, train_categories, test_categories)
     log_line(train_log, f"Observed training path categories: {observed}")
+    dataset = source_dataset
     max_samples, epochs = args.max_train_samples, args.epochs
     if args.debug:
         max_samples, epochs = max_samples or min(8, len(dataset)), 1
         log_line(train_log, f"Debug mode: epochs=1, max_train_samples={max_samples}")
-    training_data = dataset if max_samples <= 0 else Subset(
-        dataset, range(min(max_samples, len(dataset)))
+    candidate_indices = list(range(len(dataset)))
+    if max_samples > 0:
+        candidate_indices = candidate_indices[:min(max_samples, len(candidate_indices))]
+    train_indices, val_indices = stratified_holdout_indices(
+        dataset, candidate_indices, args.validation_fraction, args.seed
     )
+    training_data = Subset(dataset, train_indices)
+    validation_data = Subset(dataset, val_indices) if val_indices else None
+    log_line(train_log, f"Training samples: {len(train_indices)}")
+    if validation_data is not None:
+        log_line(train_log, f"Validation holdout samples: {len(val_indices)}")
+    train_seed_kwargs = dataloader_seed_kwargs(args.seed)
     loader = DataLoader(
         training_data, batch_size=args.batch_size, shuffle=True, drop_last=False,
         num_workers=args.num_workers, pin_memory=args.device == "cuda",
+        **train_seed_kwargs,
+    )
+    val_loader = (
+        DataLoader(
+            validation_data, batch_size=args.batch_size, shuffle=False, drop_last=False,
+            num_workers=args.num_workers, pin_memory=args.device == "cuda",
+            **dataloader_seed_kwargs(args.seed),
+        )
+        if validation_data is not None else None
     )
 
     device = "cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu"
     encoder = ULIP2Encoder(
         args.model_path, device=device, num_points=args.num_points,
         return_layers=tuple(args.return_layers),
-        return_clip=args.use_geometric_cap or args.use_geometric_mode_prompt,
+        return_clip=args.use_static_prompt,
     )
     adapter = MultiLayerPatchAdapter(
         args.token_dim, args.text_dim, len(args.feature_layers)
     ).to(device)
-    prompt_learner, prior_network = build_cap_modules(args, encoder, adapter, device)
-    mode_prompt_model = build_geometric_mode_model(args, encoder, adapter, device)
-    if mode_prompt_model is not None:
+    parameter_counts = None
+    prompt_model = build_static_prompt_model(args, encoder, adapter, device)
+    if prompt_model is not None:
+        log_line(
+            train_log,
+            "Loaded visual adapter training mode="
+            f"{getattr(args, 'visual_source_training_mode', 'unknown')}",
+        )
+        parameter_counts = prompt_parameter_counts(prompt_model)
+        log_line(train_log, f"Prompt parameter counts: {parameter_counts}")
         parameter_groups = [
-            {"params": mode_prompt_model.prompt_bank.parameters(), "lr": args.prompt_learning_rate},
-            {"params": mode_prompt_model.graph_encoder.parameters(), "lr": args.prior_learning_rate},
-            {"params": mode_prompt_model.mode_router.parameters(), "lr": args.prior_learning_rate},
-            {"params": mode_prompt_model.prompt_modulator.parameters(), "lr": args.prior_learning_rate},
+            {
+                "params": prompt_model.parameters(),
+                "lr": args.prompt_learning_rate,
+            },
         ]
         if not args.freeze_visual_adapter:
-            parameter_groups.append({"params": adapter.parameters(), "lr": args.learning_rate})
-        optimizer = AdamW(parameter_groups, weight_decay=args.weight_decay)
-        fixed_normal = fixed_anomaly = None
-    elif args.use_geometric_cap:
-        parameter_groups = [{"params": prompt_learner.parameters(), "lr": args.prompt_learning_rate}]
-        if not args.freeze_visual_adapter:
-            parameter_groups.append(
-                {"params": adapter.parameters(), "lr": args.learning_rate}
-            )
-        if prior_network is not None:
-            parameter_groups.append({"params": prior_network.parameters(), "lr": args.prior_learning_rate})
+            parameter_groups.append({
+                "params": adapter.parameters(), "lr": args.learning_rate
+            })
         optimizer = AdamW(parameter_groups, weight_decay=args.weight_decay)
         fixed_normal = fixed_anomaly = None
     else:
-        optimizer = AdamW(adapter.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-        fixed_normal = encoder.encode_text_templates(args.normal_templates).detach()
-        fixed_anomaly = encoder.encode_text_templates(args.anomaly_templates).detach()
+        optimizer = AdamW(
+            adapter.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+        fixed_normal = encoder.encode_text_templates(
+            args.normal_templates
+        ).detach()
+        fixed_anomaly = encoder.encode_text_templates(
+            args.anomaly_templates
+        ).detach()
 
     scheduler = build_warmup_cosine_scheduler(
         optimizer, epochs * len(loader), args.warmup_ratio, args.minimum_learning_rate
     )
+    start_epoch = 0
+    resume_payload = None
+    if args.resume_checkpoint:
+        resume_path = Path(
+            args.resume_checkpoint.format(train_category=args.train_category)
+        )
+        resume_payload = torch.load(
+            resume_path, map_location=device, weights_only=False
+        )
+        if "optimizer" not in resume_payload or "scheduler" not in resume_payload:
+            raise RuntimeError(
+                "Resume checkpoint lacks optimizer/scheduler state: "
+                f"{resume_path}"
+            )
+        optimizer.load_state_dict(resume_payload["optimizer"])
+        if scheduler is not None and resume_payload["scheduler"] is not None:
+            scheduler.load_state_dict(resume_payload["scheduler"])
+        if "dataloader_generator_state" in resume_payload:
+            train_seed_kwargs["generator"].set_state(
+                resume_payload["dataloader_generator_state"]
+            )
+        start_epoch = int(resume_payload.get("epoch", 0))
+        args.training_time_offset = float(
+            resume_payload.get("training_time_seconds") or 0.0
+        )
+        if start_epoch < 0 or start_epoch >= epochs:
+            raise RuntimeError(
+                f"Resume epoch {start_epoch} is outside [0, {epochs})"
+            )
+        log_line(
+            train_log,
+            f"Resume NCRP training: checkpoint={resume_path} start_epoch={start_epoch}",
+        )
     focal_loss = BinaryFocalLoss(args.focal_gamma, args.focal_alpha)
     dice_loss = BinaryDiceLoss()
     object_loss = nn.BCELoss()
-    best_loss = float("inf")
-    for epoch in range(epochs):
+    best_loss = float(
+        resume_payload.get("best_loss_so_far", float("inf"))
+        if resume_payload is not None
+        else float("inf")
+    )
+    best_val_object_auroc = float(
+        resume_payload.get("best_val_object_auroc_so_far", float("-inf"))
+        if resume_payload is not None
+        else float("-inf")
+    )
+    final_training_statistics = None
+    last_validation_metrics = None
+    ncrp_training_curve = list(
+        (((resume_payload or {}).get("training_statistics") or {}).get("ncrp") or {}).get(
+            "training_curve", []
+        )
+    )
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    for epoch in range(start_epoch, epochs):
         adapter.train(
-            not (args.use_geometric_cap or args.use_geometric_mode_prompt)
-            or not args.freeze_visual_adapter
+            not args.use_static_prompt or not args.freeze_visual_adapter
         )
-        if prompt_learner is not None:
-            prompt_learner.train()
-        if prior_network is not None:
-            prior_network.train()
-        if mode_prompt_model is not None:
-            mode_prompt_model.train()
-        totals = {name: 0.0 for name in (
-            "local", "object", "orthogonal", "prior", "invariance",
-            "mode_diversity", "mode_entropy", "mode_assignment",
-            "geometry_gate", "residual_suppression", "se3_sanity", "total",
-        )}
-        mode_usage_sum = (
-            torch.zeros(args.num_geometric_modes, device=device)
-            if mode_prompt_model is not None else None
-        )
-        mode_usage_sq_sum = (
-            torch.zeros(args.num_geometric_modes, device=device)
-            if mode_prompt_model is not None else None
-        )
-        mode_sample_count = 0
-        mode_max_sum = mode_entropy_sum = delta_norm_sum = 0.0
-        normal_delta_sum = abnormal_delta_sum = 0.0
-        normal_delta_count = abnormal_delta_count = 0
-        anomaly_patch_usage_sum = torch.zeros(args.num_geometric_modes, device=device)
-        normal_patch_usage_sum = torch.zeros(args.num_geometric_modes, device=device)
-        anomaly_patch_count = normal_patch_count = 0
-        anomaly_patch_entropy_sum = normal_patch_entropy_sum = 0.0
-        anomaly_patch_confidence_sum = normal_patch_confidence_sum = 0.0
-        anomaly_gate_probability_sum = normal_gate_probability_sum = 0.0
+        if prompt_model is not None:
+            prompt_model.train()
+        totals = {
+            name: 0.0
+            for name in (
+                "local",
+                "object",
+                "prompt_diversity",
+                "focal",
+                "dice",
+                "total",
+            )
+        }
+        ncrp_normal_residual_sum = 0.0
+        ncrp_abnormal_residual_sum = 0.0
+        ncrp_normal_residual_count = 0
+        ncrp_abnormal_residual_count = 0
         for batch in loader:
             points = batch["points"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            object_names = [args.train_category] * points.shape[0]
+            category_names = PointCloudDataset.PRESETS[args.dataset_name]
+            object_names = [
+                category_names[int(category)] for category in batch["category"]
+            ]
             object_labels = (labels > 0).any(dim=1).float()
-            features = encoder.encode_pointcloud(points, return_intermediate=True)
-            tokens = select_multi_layer_tokens(
-                features["layer_feats"], features["patch_idx"], args.feature_layers
+            features = encoder.encode_pointcloud(
+                points, return_intermediate=True
             )
-            patch_embeddings = adapter(tokens)
-            zero = patch_embeddings.sum() * 0.0
-            orthogonal = prior_loss = invariance_loss = zero
-            diversity = entropy_loss = assignment_loss = gate_loss = suppression = sanity = zero
+            tokens = select_multi_layer_tokens(
+                features["layer_feats"],
+                features["patch_idx"],
+                args.feature_layers,
+            )
 
-            if mode_prompt_model is not None:
-                geometry = mode_prompt_model.forward_geometry(points, features["patch_idx"])
-                patch_anomaly_mask, patch_anomaly_ratio = point_mask_to_patch_targets(
-                    labels, features["patch_idx"], args.mode_anomaly_patch_threshold
+            if prompt_model is not None:
+                score_output = forward_prompt_scores(
+                    args,
+                    adapter,
+                    tokens,
+                    features["concat"],
+                    prompt_model,
+                    encoder.open_clip_model,
+                    object_names,
                 )
-                patch_routing_weights = (
-                    geometry["node_mode_weights"]
-                    if args.use_patch_mode_routing
-                    else geometry["mode_weights"]
-                )
-                patch_gate_logits = (
-                    geometry["abnormal_gate_logits"]
-                    if args.use_geometry_abnormal_gate else None
-                )
-                gate_top_count = max(
-                    1, int(geometry["abnormal_gate_logits"].shape[1] * args.top_percent)
-                )
-                sample_gate_logits = (
-                    geometry["abnormal_gate_logits"].topk(
-                        gate_top_count, dim=1
-                    ).values.mean(dim=1)
-                    if args.use_geometry_abnormal_gate else None
-                )
-                mode_prompts = encode_geometric_mode_prompts(
-                    mode_prompt_model, encoder.open_clip_model, object_names, geometry["delta_A"]
-                )
-                patch_logits = mode_aware_anomaly_logits(
-                    patch_embeddings,
-                    mode_prompts["normal_text_embed"],
-                    mode_prompts["dynamic_abnormal_text_embeds"],
-                    patch_routing_weights,
-                    args.temperature,
-                    args.mode_score_type,
-                    args.use_mode_weighted_scoring,
-                    args.mode_score_temperature,
-                    patch_gate_logits,
-                    args.geometry_gate_logit_scale,
-                )
-                global_logits = mode_aware_anomaly_logits(
-                    features["concat"].unsqueeze(1),
-                    mode_prompts["normal_text_embed"],
-                    mode_prompts["dynamic_abnormal_text_embeds"],
-                    geometry["mode_weights"],
-                    args.temperature,
-                    args.mode_score_type,
-                    args.use_mode_weighted_scoring,
-                    args.mode_score_temperature,
-                    sample_gate_logits,
-                    args.geometry_gate_logit_scale,
-                ).squeeze(1)
-                if args.use_mode_diversity_loss:
-                    diversity = mode_diversity_loss(
-                        mode_prompts["dynamic_abnormal_text_embeds"]
+                patch_embeddings = score_output["patch_embeddings"]
+                patch_logits = score_output["patch_logits"]
+                global_logits = score_output["global_logits"]
+                diversity = patch_embeddings.sum() * 0.0
+                if args.use_prompt_diversity_loss:
+                    diversity = prompt_diversity_loss(
+                        score_output["diversity_embeddings"]
                     )
-                if args.use_mode_entropy_loss:
-                    entropy_loss = mode_entropy_regularization(
-                        geometry["node_mode_weights"],
-                        args.mode_conditional_entropy_weight,
-                        patch_anomaly_mask,
+                residual_masks = None
+                if args.residual_prompt_enabled:
+                    anomaly_mask, normal_mask, _, _ = point_mask_to_patch_targets(
+                        labels,
+                        features["patch_idx"],
+                        args.patch_anomaly_threshold,
                     )
-                if args.use_sinkhorn_mode_assignment:
-                    assignment_loss = sinkhorn_mode_assignment_loss(
-                        geometry["node_mode_logits"], patch_anomaly_mask,
-                        args.sinkhorn_epsilon, args.sinkhorn_iterations,
-                        args.mode_router_temperature,
-                    )
-                if args.use_geometry_abnormal_gate:
-                    gate_targets = patch_anomaly_mask.to(
-                        geometry["abnormal_gate_logits"].dtype
-                    )
-                    gate_loss = geometry_gate_supervision_loss(
-                        geometry["abnormal_gate_logits"], gate_targets,
-                        args.geometry_gate_margin,
-                    )
-                if args.use_residual_suppression_loss:
-                    suppression = residual_suppression_loss(
-                        geometry["delta_A"], object_labels
-                    )
-                if args.lambda_se3_sanity > 0:
-                    transformed = mode_prompt_model.forward_geometry(
-                        random_mode_se3_transform(points), features["patch_idx"]
-                    )
-                    sanity = se3_sanity_loss(
-                        geometry["mode_weights"], transformed["mode_weights"],
-                        geometry["delta_A"], transformed["delta_A"],
-                    )
-                with torch.no_grad():
-                    weights = geometry["mode_weights"]
-                    entropy_values = normalized_mode_entropy(weights)
-                    delta_per_sample = geometry["delta_A"].norm(dim=-1).mean(dim=(1, 2))
-                    mode_usage_sum += weights.sum(dim=0)
-                    mode_usage_sq_sum += weights.square().sum(dim=0)
-                    mode_sample_count += points.shape[0]
-                    mode_max_sum += float(weights.max(dim=-1).values.sum())
-                    mode_entropy_sum += float(entropy_values.sum())
-                    delta_norm_sum += float(delta_per_sample.sum())
-                    normal_mask = object_labels <= 0
-                    abnormal_mask = object_labels > 0
-                    if normal_mask.any():
-                        normal_delta_sum += float(delta_per_sample[normal_mask].sum())
-                        normal_delta_count += int(normal_mask.sum())
-                    if abnormal_mask.any():
-                        abnormal_delta_sum += float(delta_per_sample[abnormal_mask].sum())
-                        abnormal_delta_count += int(abnormal_mask.sum())
-                    normal_patch_mask = ~patch_anomaly_mask
-                    if patch_anomaly_mask.any():
-                        selected = geometry["node_mode_weights"][patch_anomaly_mask]
-                        anomaly_patch_usage_sum += selected.sum(dim=0)
-                        anomaly_patch_count += selected.shape[0]
-                        anomaly_patch_entropy_sum += float(
-                            normalized_mode_entropy(selected).sum()
-                        )
-                        anomaly_patch_confidence_sum += float(
-                            selected.max(dim=-1).values.sum()
-                        )
-                        anomaly_gate_probability_sum += float(
-                            geometry["abnormal_gate_logits"][patch_anomaly_mask]
-                            .sigmoid().sum()
-                        )
-                    if normal_patch_mask.any():
-                        selected = geometry["node_mode_weights"][normal_patch_mask]
-                        normal_patch_usage_sum += selected.sum(dim=0)
-                        normal_patch_count += selected.shape[0]
-                        normal_patch_entropy_sum += float(
-                            normalized_mode_entropy(selected).sum()
-                        )
-                        normal_patch_confidence_sum += float(
-                            selected.max(dim=-1).values.sum()
-                        )
-                        normal_gate_probability_sum += float(
-                            geometry["abnormal_gate_logits"][normal_patch_mask]
-                            .sigmoid().sum()
-                        )
-            elif prompt_learner is None:
+                    residual_masks = (anomaly_mask, normal_mask)
+            else:
+                patch_embeddings = adapter(tokens)
                 patch_logits = patch_text_logits(
-                    patch_embeddings, fixed_normal, fixed_anomaly, args.temperature
+                    patch_embeddings,
+                    fixed_normal,
+                    fixed_anomaly,
+                    args.temperature,
                 )
+                diversity = patch_embeddings.sum() * 0.0
+                residual_masks = None
                 global_logits = patch_text_logits(
                     features["concat"].unsqueeze(1),
-                    fixed_normal, fixed_anomaly, args.temperature,
+                    fixed_normal,
+                    fixed_anomaly,
+                    args.temperature,
                 ).squeeze(1)
-            else:
-                base_prompts = encode_geometric_prompts(
-                    prompt_learner, encoder.open_clip_model, object_names=object_names
-                )
-                dynamic_proto = None
-                if prior_network is not None:
-                    prior_result = prior_network(
-                        patch_embeddings, base_prompts["normal_text_embed"],
-                        base_prompts["abnormal_text_proto"], points, features["patch_idx"],
-                    )
-                    if args.lambda_geometry_invariance > 0:
-                        transformed_points = random_se3_transform(points)
-                        transformed_prior = prior_network(
-                            patch_embeddings.detach(), base_prompts["normal_text_embed"],
-                            base_prompts["abnormal_text_proto"], transformed_points,
-                            features["patch_idx"],
-                        )
-                        invariance_loss = geometric_prior_invariance_loss(
-                            prior_result["prior"], transformed_prior["prior"]
-                        )
-                    dynamic_prompts = encode_prior_enabled_abnormal_prompts(
-                        prompt_learner, encoder.open_clip_model, prior_result["prior"],
-                        object_names=object_names,
-                    )
-                    dynamic_proto = dynamic_prompts["prior_enabled_abnormal_text_proto"]
-                    prior_loss = normal_sample_prior_loss(
-                        prior_result["prior"], object_labels
-                    )
-                patch_logits = geometric_anomaly_logits(
-                    patch_embeddings, base_prompts["normal_text_embed"],
-                    base_prompts["abnormal_text_proto"], dynamic_proto, args.temperature,
-                )
-                global_logits = geometric_anomaly_logits(
-                    features["concat"].unsqueeze(1), base_prompts["normal_text_embed"],
-                    base_prompts["abnormal_text_proto"], dynamic_proto, args.temperature,
-                ).squeeze(1)
-                orthogonal = abnormal_prompt_orthogonal_loss(
-                    base_prompts["abnormal_text_embeds"]
-                )
 
             point_logits = patch_to_point(
                 patch_logits, features["patch_idx"], labels.shape[1]
             )
-            object_probability = aggregate_object_probability(
-                global_logits, patch_logits, args.global_alpha, args.top_percent
+            object_probability = pool_training_object_probability(
+                args, global_logits, patch_logits
             )
-            local = (
-                args.focal_weight * focal_loss(point_logits, labels)
-                + args.dice_weight * dice_loss(point_logits, labels)
-            )
+            focal_value = args.focal_weight * focal_loss(point_logits, labels)
+            dice_value = args.dice_weight * dice_loss(point_logits, labels)
+            local = focal_value + dice_value
             object_value = object_loss(
                 object_probability, object_labels.to(object_probability.dtype)
             )
             total = local + args.object_weight * object_value
-            if mode_prompt_model is not None:
-                if args.use_mode_diversity_loss:
-                    total = total + args.lambda_mode_diversity * diversity
-                if args.use_mode_entropy_loss:
-                    total = total + args.lambda_mode_entropy * entropy_loss
-                if args.use_sinkhorn_mode_assignment:
-                    total = total + args.lambda_mode_assignment * assignment_loss
-                if args.use_geometry_abnormal_gate:
-                    total = total + args.lambda_geometry_gate * gate_loss
-                if args.use_residual_suppression_loss:
-                    total = total + args.lambda_residual_suppression * suppression
-                total = total + args.lambda_se3_sanity * sanity
-            elif prompt_learner is not None:
-                total = total + args.lambda_prompt_orthogonal * orthogonal
-                total = total + args.lambda_prior * prior_loss
-                total = total + args.lambda_geometry_invariance * invariance_loss
+            if prompt_model is not None and args.use_prompt_diversity_loss:
+                total = total + args.lambda_prompt_diversity * diversity
             optimizer.zero_grad(set_to_none=True)
-            total.backward()
-            if args.gradient_clip_norm > 0:
-                trainable_parameters = [
-                    parameter for group in optimizer.param_groups
-                    for parameter in group["params"] if parameter.grad is not None
-                ]
-                torch.nn.utils.clip_grad_norm_(
-                    trainable_parameters, args.gradient_clip_norm
-                )
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
+            if total.requires_grad:
+                total.backward()
+                if args.gradient_clip_norm > 0:
+                    trainable_parameters = [
+                        parameter
+                        for group in optimizer.param_groups
+                        for parameter in group["params"]
+                        if parameter.grad is not None
+                    ]
+                    torch.nn.utils.clip_grad_norm_(
+                        trainable_parameters, args.gradient_clip_norm
+                    )
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
             for name, value in (
-                ("local", local), ("object", object_value),
-                ("orthogonal", orthogonal), ("prior", prior_loss),
-                ("invariance", invariance_loss), ("mode_diversity", diversity),
-                ("mode_entropy", entropy_loss), ("mode_assignment", assignment_loss),
-                ("geometry_gate", gate_loss), ("residual_suppression", suppression),
-                ("se3_sanity", sanity), ("total", total),
+                ("local", local),
+                ("object", object_value),
+                ("prompt_diversity", diversity),
+                ("focal", focal_value),
+                ("dice", dice_value),
+                ("total", total),
             ):
                 totals[name] += float(value.detach())
+            if args.residual_prompt_enabled and residual_masks is not None:
+                anomaly_mask, normal_mask = residual_masks
+                residual_norms = score_output["residual_norms"].detach()
+                if normal_mask.any():
+                    ncrp_normal_residual_sum += float(residual_norms[normal_mask].sum())
+                    ncrp_normal_residual_count += int(normal_mask.sum())
+                if anomaly_mask.any():
+                    ncrp_abnormal_residual_sum += float(residual_norms[anomaly_mask].sum())
+                    ncrp_abnormal_residual_count += int(anomaly_mask.sum())
 
-        averages = {name: value / max(1, len(loader)) for name, value in totals.items()}
-        if mode_prompt_model is not None:
-            display_names = ["local", "object"]
-            if args.use_mode_diversity_loss:
-                display_names.append("mode_diversity")
-            if args.use_mode_entropy_loss:
-                display_names.append("mode_entropy")
-            if args.use_sinkhorn_mode_assignment:
-                display_names.append("mode_assignment")
-            if args.use_geometry_abnormal_gate:
-                display_names.append("geometry_gate")
-            if args.use_residual_suppression_loss:
-                display_names.append("residual_suppression")
-            if args.lambda_se3_sanity > 0:
-                display_names.append("se3_sanity")
-        else:
-            display_names = ["local", "object", "orthogonal", "prior"]
-            if args.lambda_geometry_invariance > 0:
-                display_names.append("invariance")
+        averages = {
+            name: value / max(1, len(loader))
+            for name, value in totals.items()
+        }
+        display_names = ["local", "object"]
+        if prompt_model is not None and args.use_prompt_diversity_loss:
+            display_names.append("prompt_diversity")
+        if prompt_model is not None and args.residual_prompt_enabled:
+            display_names = ["focal", "dice", "object"]
         display_names.append("total")
         epoch_message = f"Epoch {epoch + 1}/{epochs} | " + " | ".join(
             f"{name}={averages[name]:.6f}" for name in display_names
         )
         epoch_message += f" | lr={optimizer.param_groups[0]['lr']:.8f}"
-        if mode_prompt_model is not None:
-            count = max(1, mode_sample_count)
-            usage_tensor = mode_usage_sum / count
-            usage_std_tensor = (
-                mode_usage_sq_sum / count - usage_tensor.square()
-            ).clamp_min(0).sqrt()
-            conditional_entropy = mode_entropy_sum / count
-            marginal_entropy = float(
-                -(usage_tensor * usage_tensor.clamp_min(1e-8).log()).sum()
-                / np.log(args.num_geometric_modes)
-            )
-            mode_information = marginal_entropy - conditional_entropy
-            usage = usage_tensor.detach().cpu().tolist()
-            usage_std = usage_std_tensor.detach().cpu().tolist()
-            anomaly_usage = (
-                anomaly_patch_usage_sum / max(1, anomaly_patch_count)
-            ).detach().cpu().tolist()
-            normal_usage = (
-                normal_patch_usage_sum / max(1, normal_patch_count)
-            ).detach().cpu().tolist()
+        if prompt_model is not None and not args.residual_prompt_enabled:
             epoch_message += (
-                f" | mode_weights_mean={1.0 / args.num_geometric_modes:.6f}"
-                f" | mode_weights_max={mode_max_sum / count:.6f}"
-                f" | mode_conditional_entropy={conditional_entropy:.6f}"
-                f" | mode_marginal_entropy={marginal_entropy:.6f}"
-                f" | mode_information={mode_information:.6f}"
-                f" | mode_usage={[round(value, 6) for value in usage]}"
-                f" | mode_usage_std={[round(value, 6) for value in usage_std]}"
-                f" | delta_A_norm={delta_norm_sum / count:.6f}"
-                f" | normal_delta_A_norm={normal_delta_sum / max(1, normal_delta_count):.6f}"
-                f" | abnormal_delta_A_norm={abnormal_delta_sum / max(1, abnormal_delta_count):.6f}"
-                f" | anomaly_patch_entropy={anomaly_patch_entropy_sum / max(1, anomaly_patch_count):.6f}"
-                f" | anomaly_patch_confidence={anomaly_patch_confidence_sum / max(1, anomaly_patch_count):.6f}"
-                f" | normal_patch_entropy={normal_patch_entropy_sum / max(1, normal_patch_count):.6f}"
-                f" | normal_patch_confidence={normal_patch_confidence_sum / max(1, normal_patch_count):.6f}"
-                f" | anomaly_gate_probability={anomaly_gate_probability_sum / max(1, anomaly_patch_count):.6f}"
-                f" | normal_gate_probability={normal_gate_probability_sum / max(1, normal_patch_count):.6f}"
-                f" | anomaly_patch_usage={[round(value, 6) for value in anomaly_usage]}"
-                f" | normal_patch_usage={[round(value, 6) for value in normal_usage]}"
+                f" | static_abnormal_prompts={args.num_abnormal_prompts}"
+            )
+        ncrp_normal_residual = ncrp_normal_residual_sum / max(
+            1, ncrp_normal_residual_count
+        )
+        ncrp_abnormal_residual = ncrp_abnormal_residual_sum / max(
+            1, ncrp_abnormal_residual_count
+        )
+        # Stage 1 has no Prompt model and therefore never creates score_output.
+        # Keep the shared epoch diagnostics path safe for visual-only training.
+        ncrp_score_output = (
+            score_output
+            if args.residual_prompt_enabled and prompt_model is not None
+            else {}
+        )
+        ncrp_directions = ncrp_score_output.get("local_projected_directions")
+        if ncrp_directions is None:
+            ncrp_directions = ncrp_score_output.get("projected_directions")
+        ncrp_gram = (
+            (
+                ncrp_directions.detach()
+                @ ncrp_directions.detach().transpose(-1, -2)
+            ).mean(0)
+            if ncrp_directions is not None
+            else torch.eye(args.residual_num_bases, device=device)
+        )
+        basis_normal_inner = ncrp_score_output.get(
+            "basis_normal_max_abs_inner_product"
+        )
+        ncrp_epoch = {
+            "epoch": epoch + 1,
+            "total_loss": averages["total"],
+            "focal_loss": averages["focal"],
+            "dice_loss": averages["dice"],
+            "object_loss": averages["object"],
+            "basis_gram_off_diagonal_mean": 0.0,
+            "basis_usage": [1.0],
+            "assignment_entropy": None,
+            "normalized_assignment_entropy": None,
+            "assignment_diagnostics_status": "not_applicable_single_basis",
+            "basis_usage_status": "structural_single_basis",
+            "max_assignment_weight": 1.0,
+            "normal_residual_norm": ncrp_normal_residual,
+            "abnormal_residual_norm": ncrp_abnormal_residual,
+            "basis_normal_max_abs_inner_product": (
+                float(basis_normal_inner.detach().max())
+                if basis_normal_inner is not None
+                else None
+            ),
+        }
+        if args.residual_prompt_enabled:
+            ncrp_training_curve.append(ncrp_epoch)
+        final_training_statistics = {
+            "visual_adapter_training_mode": args.visual_adapter_training_mode,
+            "visual_adapter_layer_weights": [
+                float(value)
+                for value in adapter.layer_weights().detach().cpu()
+            ],
+            "ncrp": {
+                "enabled": bool(args.residual_prompt_enabled),
+                **ncrp_epoch,
+                "basis_gram_matrix": ncrp_gram.detach().cpu().tolist(),
+                "training_curve": list(ncrp_training_curve),
+            },
+        }
+        if prompt_model is not None and args.residual_prompt_enabled:
+            epoch_message += (
+                " | basis_usage=[1.0]"
+                " | assignment=not_applicable_single_basis"
+                " | normal_residual_norm="
+                f"{ncrp_normal_residual:.6f}"
+                " | abnormal_residual_norm="
+                f"{ncrp_abnormal_residual:.6f}"
             )
         log_line(train_log, epoch_message)
+
+        validation_metrics = None
+        if val_loader is not None and (
+            (epoch + 1) % args.validation_interval == 0
+            or epoch + 1 == epochs
+        ):
+            validation_metrics = evaluate_holdout_object_metrics(
+                args,
+                val_loader,
+                encoder,
+                adapter,
+                prompt_model,
+                fixed_normal,
+                fixed_anomaly,
+                device,
+            )
+            last_validation_metrics = validation_metrics
+            log_line(
+                train_log,
+                "Validation"
+                f" | object_auroc={validation_metrics['val_object_auroc']:.6f}"
+                f" | object_ap={validation_metrics['val_object_ap']:.6f}"
+                f" | samples={validation_metrics['val_samples']}",
+            )
+            if "source_top_ratio_metrics" in validation_metrics:
+                log_line(
+                    train_log,
+                    "Source-only top-ratio validation"
+                    f" | metrics={validation_metrics['source_top_ratio_metrics']}"
+                    " | selected="
+                    f"{validation_metrics['source_selected_top_ratio']:g}",
+                )
+
         if averages["total"] < best_loss:
             best_loss = averages["total"]
-            state = {
-                "adapter": adapter.state_dict(), "train_category": args.train_category,
-                "feature_layers": list(args.feature_layers), "token_dim": args.token_dim,
-                "text_dim": args.text_dim, "epoch": epoch + 1, "loss": best_loss,
-                "use_geometric_cap": args.use_geometric_cap,
-                "use_geometric_dap": args.use_geometric_dap,
-                "use_geometric_mode_prompt": args.use_geometric_mode_prompt,
-                "geometric_mode_version": args.geometric_mode_version if args.use_geometric_mode_prompt else None,
-                "num_geometric_modes": args.num_geometric_modes if args.use_geometric_mode_prompt else None,
-                "prompt_template": args.prompt_template if args.use_geometric_mode_prompt else None,
-                "use_category_prompt": args.use_category_prompt if args.use_geometric_mode_prompt else None,
-                "use_patch_mode_routing": args.use_patch_mode_routing if args.use_geometric_mode_prompt else None,
-                "mode_anomaly_patch_threshold": args.mode_anomaly_patch_threshold if args.use_geometric_mode_prompt else None,
-                "use_geometry_abnormal_gate": args.use_geometry_abnormal_gate if args.use_geometric_mode_prompt else None,
-                "use_sinkhorn_mode_assignment": args.use_sinkhorn_mode_assignment if args.use_geometric_mode_prompt else None,
-                "mode_score_type": args.mode_score_type if args.use_geometric_mode_prompt else None,
-                "dap_version": "se3_graph_v1" if args.use_geometric_dap else None,
-                "prompt_suffix_mode": "prompt_template_v1" if args.use_geometric_cap else None,
-                "geometric_prompt_suffix": args.geometric_prompt_suffix if args.use_geometric_cap else None,
-            }
-            if prompt_learner is not None:
-                state["geometric_cap"] = prompt_learner.state_dict()
-            if prior_network is not None:
-                state["geometric_dap"] = prior_network.state_dict()
-            if mode_prompt_model is not None:
-                state["geometric_mode_prompt"] = mode_prompt_model.state_dict()
-            torch.save(state, run_dir / "best.pth")
-    log_line(train_log, f"Best checkpoint: {run_dir / 'best.pth'} | loss={best_loss:.6f}")
+            state = build_checkpoint_state(
+                args,
+                adapter,
+                prompt_model,
+                epoch + 1,
+                best_loss,
+                "loss",
+                best_loss,
+            )
+            state["prompt_parameter_counts"] = parameter_counts
+            state["training_statistics"] = final_training_statistics
+            state["optimizer"] = optimizer.state_dict()
+            state["scheduler"] = scheduler.state_dict() if scheduler is not None else None
+            state["best_loss_so_far"] = best_loss
+            state["best_val_object_auroc_so_far"] = best_val_object_auroc
+            state["dataloader_generator_state"] = train_seed_kwargs[
+                "generator"
+            ].get_state()
+            torch.save(state, run_dir / "best_loss.pth")
+            if args.checkpoint_metric == "loss":
+                torch.save(state, run_dir / "best.pth")
+        if validation_metrics is not None:
+            val_object_auroc = validation_metrics['val_object_auroc']
+            if (
+                np.isfinite(val_object_auroc)
+                and val_object_auroc > best_val_object_auroc
+            ):
+                best_val_object_auroc = val_object_auroc
+                state = build_checkpoint_state(
+                    args,
+                    adapter,
+                    prompt_model,
+                    epoch + 1,
+                    averages["total"],
+                    "val_object_auroc",
+                    best_val_object_auroc,
+                )
+                state.update(validation_metrics)
+                state["prompt_parameter_counts"] = parameter_counts
+                state["training_statistics"] = final_training_statistics
+                state["optimizer"] = optimizer.state_dict()
+                state["scheduler"] = scheduler.state_dict() if scheduler is not None else None
+                state["best_loss_so_far"] = best_loss
+                state["best_val_object_auroc_so_far"] = best_val_object_auroc
+                state["dataloader_generator_state"] = train_seed_kwargs[
+                    "generator"
+                ].get_state()
+                torch.save(state, run_dir / "best_object_auroc.pth")
+                if args.checkpoint_metric == "val_object_auroc":
+                    torch.save(state, run_dir / "best.pth")
+        if args.residual_prompt_enabled:
+            last_state = build_checkpoint_state(
+                args,
+                adapter,
+                prompt_model,
+                epoch + 1,
+                averages["total"],
+                "last_epoch",
+                averages["total"],
+            )
+            last_state["prompt_parameter_counts"] = parameter_counts
+            last_state["training_statistics"] = final_training_statistics
+            last_state["optimizer"] = optimizer.state_dict()
+            last_state["scheduler"] = scheduler.state_dict() if scheduler is not None else None
+            last_state["best_loss_so_far"] = best_loss
+            last_state["best_val_object_auroc_so_far"] = best_val_object_auroc
+            last_state["dataloader_generator_state"] = train_seed_kwargs[
+                "generator"
+            ].get_state()
+            torch.save(last_state, run_dir / "last.pth")
+    if args.checkpoint_metric == "val_object_auroc" and best_val_object_auroc == float("-inf"):
+        raise RuntimeError("No finite validation object AUROC was computed")
+    log_line(train_log, f"Best loss checkpoint: {run_dir / 'best_loss.pth'} | loss={best_loss:.6f}")
+    if best_val_object_auroc > float("-inf"):
+        log_line(
+            train_log,
+            f"Best object-AUROC checkpoint: {run_dir / 'best_object_auroc.pth'}"
+            f" | val_object_auroc={best_val_object_auroc:.6f}",
+        )
+    log_line(train_log, f"Selected checkpoint: {run_dir / 'best.pth'} | metric={args.checkpoint_metric}")
+    training_time_seconds = (
+        args.training_time_offset + time.perf_counter() - training_started
+    )
+    log_line(
+        train_log,
+        "Training resources"
+        f" | time_seconds={training_time_seconds:.3f}"
+        " | peak_gpu_memory_bytes="
+        f"{int(torch.cuda.max_memory_allocated()) if device == 'cuda' else 0}",
+    )
     write_yaml(
         run_dir / "training_complete.yaml",
         {
             "train_category": args.train_category,
+            "train_categories": list(args.train_categories),
             "dataset_name": args.dataset_name,
             "epochs": epochs,
             "best_loss": float(best_loss),
-            "use_geometric_mode_prompt": args.use_geometric_mode_prompt,
-            "geometric_mode_version": args.geometric_mode_version if args.use_geometric_mode_prompt else None,
-            "prompt_template": args.prompt_template if args.use_geometric_mode_prompt else None,
-            "use_patch_mode_routing": args.use_patch_mode_routing if args.use_geometric_mode_prompt else None,
-            "mode_anomaly_patch_threshold": args.mode_anomaly_patch_threshold if args.use_geometric_mode_prompt else None,
-            "use_geometry_abnormal_gate": args.use_geometry_abnormal_gate if args.use_geometric_mode_prompt else None,
-            "use_sinkhorn_mode_assignment": args.use_sinkhorn_mode_assignment if args.use_geometric_mode_prompt else None,
-            "mode_score_type": args.mode_score_type if args.use_geometric_mode_prompt else None,
-            "dap_version": "se3_graph_v1" if args.use_geometric_dap else None,
-            "prompt_suffix_mode": "prompt_template_v1" if args.use_geometric_cap else None,
-            "geometric_prompt_suffix": args.geometric_prompt_suffix if args.use_geometric_cap else None,
+            "best_val_object_auroc": (
+                float(best_val_object_auroc)
+                if best_val_object_auroc > float("-inf") else None
+            ),
+            "checkpoint_metric": args.checkpoint_metric,
+            "seed": args.seed,
+            "seed_report": seed_report,
+            "validation_fraction": args.validation_fraction,
+            "validation_interval": args.validation_interval,
+            "use_static_prompt": args.use_static_prompt,
+            "static_prompt_version": (
+                args.static_prompt_version if args.use_static_prompt else None
+            ),
+            "num_abnormal_prompts": (
+                args.num_abnormal_prompts if args.use_static_prompt else None
+            ),
+            "prompt_template": (
+                args.prompt_template if args.use_static_prompt else None
+            ),
+            "prompt_score_temperature": (
+                args.prompt_score_temperature
+                if args.use_static_prompt else None
+            ),
+            "object_pooling_mode": args.object_pooling_mode,
+            "object_top_ratio": args.object_top_ratio,
+            "visual_adapter_training_mode": args.visual_adapter_training_mode,
+            "required_visual_adapter_training_mode": (
+                args.required_visual_adapter_training_mode
+            ),
+            "visual_source_training_mode": getattr(
+                args, "visual_source_training_mode", None
+            ),
+            "residual_prompt_enabled": args.residual_prompt_enabled,
+            "residual_num_bases": args.residual_num_bases,
+            "residual_gamma": args.residual_gamma,
+            "residual_eps": args.residual_eps,
+            "prompt_parameter_counts": parameter_counts,
+            "training_statistics": final_training_statistics,
+            "training_time_seconds": training_time_seconds,
+            "peak_gpu_memory_bytes": (
+                int(torch.cuda.max_memory_allocated()) if device == "cuda" else 0
+            ),
+            "source_top_ratio_metrics": (
+                last_validation_metrics.get("source_top_ratio_metrics")
+                if last_validation_metrics is not None
+                else None
+            ),
+            "source_selected_top_ratio": (
+                last_validation_metrics.get("source_selected_top_ratio")
+                if last_validation_metrics is not None
+                else None
+            ),
             "complete": True,
         },
     )

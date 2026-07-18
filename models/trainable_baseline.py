@@ -29,18 +29,31 @@ class MultiLayerPatchAdapter(nn.Module):
         )
         self.layer_logits = nn.Parameter(torch.zeros(num_layers))
 
-    def forward(self, layer_tokens):
+    def forward_layers(self, layer_tokens):
+        """Return each independently projected layer without fusing them."""
         if len(layer_tokens) != len(self.adapters):
             raise ValueError(
                 f"Expected {len(self.adapters)} feature layers, got {len(layer_tokens)}"
             )
-        projected = torch.stack(
-            [adapter(tokens) for adapter, tokens in zip(self.adapters, layer_tokens)],
-            dim=0,
+        return tuple(
+            adapter(tokens)
+            for adapter, tokens in zip(self.adapters, layer_tokens)
         )
+
+    def fuse_layers(self, projected_layers):
+        """Fuse already projected layers with the original learned weights."""
+        if len(projected_layers) != len(self.adapters):
+            raise ValueError(
+                f"Expected {len(self.adapters)} projected layers, "
+                f"got {len(projected_layers)}"
+            )
+        projected = torch.stack(tuple(projected_layers), dim=0)
         weights = torch.softmax(self.layer_logits, dim=0)
         fused = (projected * weights[:, None, None, None]).sum(dim=0)
         return F.normalize(fused, dim=-1)
+
+    def forward(self, layer_tokens):
+        return self.fuse_layers(self.forward_layers(layer_tokens))
 
     def layer_weights(self):
         return torch.softmax(self.layer_logits, dim=0)
@@ -78,7 +91,13 @@ def patch_text_logits(patch_embeddings, normal_embedding, anomaly_embedding, tem
 
 def patch_to_point(patch_values, patch_indices, num_points):
     batch_size, _, neighborhood_size = patch_indices.shape
-    sums = torch.zeros(batch_size, num_points, device=patch_values.device)
+    # Preserve the score dtype used by the caller.
+    sums = torch.zeros(
+        batch_size,
+        num_points,
+        device=patch_values.device,
+        dtype=patch_values.dtype,
+    )
     counts = torch.zeros_like(sums)
     for batch_index in range(batch_size):
         values = patch_values[batch_index].unsqueeze(-1).expand(-1, neighborhood_size)
@@ -112,3 +131,35 @@ def aggregate_object_probability(global_logits, patch_logits, global_alpha=0.5, 
     count = max(1, int(patch_prob.shape[1] * top_percent))
     local_prob = torch.topk(patch_prob, k=count, dim=1).values.mean(dim=1)
     return global_alpha * global_prob + (1.0 - global_alpha) * local_prob
+
+
+def configurable_object_probability(
+    global_logits,
+    patch_probabilities,
+    mode="top_mean",
+    top_ratio=0.01,
+    global_alpha=0.0,
+):
+    """Pool patch probabilities for the HS6P path.
+
+    ``patch_probabilities`` may already contain inference-time calibration, so
+    this function deliberately does not apply sigmoid to them.
+    """
+    if mode not in {"top_mean", "top_max", "global_patch_fusion"}:
+        raise ValueError(f"Unsupported object pooling mode: {mode}")
+    if not 0 < top_ratio <= 1:
+        raise ValueError("top_ratio must be in (0, 1]")
+    if not 0 <= global_alpha <= 1:
+        raise ValueError("global_alpha must be in [0, 1]")
+    if patch_probabilities.ndim != 2:
+        raise ValueError("patch_probabilities must have shape [B, G]")
+    count = max(1, int(patch_probabilities.shape[1] * top_ratio))
+    if mode == "top_max":
+        return patch_probabilities.max(dim=1).values.double()
+    local = patch_probabilities.topk(count, dim=1).values.double().mean(dim=1)
+    if mode == "top_mean":
+        return local
+    if global_logits.ndim != 1 or global_logits.shape[0] != local.shape[0]:
+        raise ValueError("global_logits must have shape [B]")
+    global_probability = torch.sigmoid(global_logits.double())
+    return global_alpha * global_probability + (1.0 - global_alpha) * local

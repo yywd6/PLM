@@ -1,4 +1,5 @@
 import argparse
+from contextlib import nullcontext
 import numpy as np
 import torch.nn.functional as F
 from collections import OrderedDict
@@ -59,7 +60,9 @@ class ULIP2Encoder:
         print("ULIP2 model loaded successfully")
         return model
 
-    def encode_pointcloud(self, points: torch.Tensor, return_intermediate=False) -> dict:
+    def encode_pointcloud(
+            self, points: torch.Tensor, return_intermediate=False, enable_grad=False
+    ) -> dict:
         """
         Encode a batch of point clouds (tensor input) to embedding vectors.
 
@@ -92,7 +95,8 @@ class ULIP2Encoder:
                                         
         points = points.float().contiguous().to(self.device)
 
-        with torch.no_grad():
+        context = nullcontext() if enable_grad else torch.no_grad()
+        with context:
             if return_intermediate:
                 concat_f, global_feat, local_feat, features, neighborhood, center, patch_idx = self.model.encode_pc(
                     points, return_intermediate=True, return_layers=self.return_layers

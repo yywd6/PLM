@@ -1,8 +1,9 @@
-"""Evaluate baseline or 3D geometric CAP/DAP on one-rest targets."""
+"""Evaluate the visual baseline or static Prompts on one-rest targets."""
 
 import argparse
 from collections import defaultdict
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -11,23 +12,18 @@ from tqdm import tqdm
 
 from data.anomaly_datasets import PointCloudDataset
 from evaluation_metrics import finite_mean, point_aupro, safe_binary_metrics
-from models.geometric_cap import (
-    GeometricCompoundPromptLearner,
-    encode_geometric_prompts,
-    encode_prior_enabled_abnormal_prompts,
-    geometric_anomaly_logits,
+from models.static_prompt import (
+    StaticPromptLearner,
+    forward_static_prompt_scores,
+    point_mask_to_patch_targets as patch_mask_targets,
 )
-from models.geometric_dap import PointCloudAbnormalityPrior
-from models.geometric_mode_prompt import (
-    GeometricModePromptLearner,
-    encode_geometric_mode_prompts,
-    format_category_prompt,
-    mode_aware_anomaly_logits,
-    normalized_mode_entropy,
-    point_mask_to_patch_targets,
+from models.normal_centered_residual_prompt import (
+    NormalCenteredResidualPromptLearner,
+    forward_ncrp_k1_scores,
 )
 from models.trainable_baseline import (
     MultiLayerPatchAdapter,
+    configurable_object_probability,
     patch_text_logits,
     patch_to_point,
     aggregate_object_probability,
@@ -35,16 +31,22 @@ from models.trainable_baseline import (
 )
 from models.ulip2_encoder import ULIP2Encoder
 from one_rest_protocol import (
+    assert_no_forbidden_config_keys,
     assert_dataset_categories,
+    category_run_name,
+    checkpoint_train_categories,
     load_yaml,
     log_line,
+    normalize_train_categories,
     resolve_categories,
     validate_one_rest_flags,
     write_json,
 )
+from utils.residual_prompt_config import flatten_residual_prompt_config
+from utils.reproducibility import dataloader_seed_kwargs, seed_everything
 
 
-DEFAULT_CONFIG = "configs/trainable_baseline.yaml"
+DEFAULT_CONFIG = "configs/two_rest_static_six_prompt_v1_uniform_scoring.yaml"
 
 
 def str2bool(value):
@@ -58,17 +60,23 @@ def str2bool(value):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Evaluate ULIP baseline or 3D-CAP/DAP.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate the stage-1 visual baseline or stage-2 static Prompts."
+    )
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--protocol", choices=("baseline", "one_rest"), default="baseline")
     parser.add_argument("--train_category")
     parser.add_argument("--train_class", dest="train_category")
+    parser.add_argument("--train_categories", nargs="+")
     parser.add_argument("--dataset_name", choices=tuple(PointCloudDataset.PRESETS), default="Real3D")
     parser.add_argument("--data_root")
+    parser.add_argument("--test_dataset_name", choices=tuple(PointCloudDataset.PRESETS))
+    parser.add_argument("--test_data_root")
     parser.add_argument("--model_path")
     parser.add_argument("--train_split", choices=("train", "test"), default="test")
     parser.add_argument("--test_split", choices=("train", "test"), default="test")
     parser.add_argument("--output_root", default="outputs/trainable_baseline")
+    parser.add_argument("--output_dir")
     parser.add_argument("--checkpoint")
     parser.add_argument("--num_points", type=int, default=2048)
     parser.add_argument("--return_layers", type=int, nargs="+", default=[2, 5, 8, 11])
@@ -80,9 +88,16 @@ def build_parser():
     parser.add_argument("--anomaly_templates", nargs="+")
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--top_percent", type=float, default=0.2)
+    parser.add_argument("--sweep_top_percent", "--sweep_top_p", dest="sweep_top_percent", type=float, nargs="+")
     parser.add_argument("--global_alpha", type=float, default=0.5)
+    parser.add_argument(
+        "--object_score_mode",
+        choices=OBJECT_SCORE_MODES,
+        default="aggregate",
+    )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=111)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--max_test_samples_per_category", type=int, default=0)
@@ -91,42 +106,42 @@ def build_parser():
     parser.add_argument("--use_target_anomaly_for_training", type=str2bool, default=False)
     parser.add_argument("--save_per_category_metrics", type=str2bool, default=True)
     parser.add_argument("--save_mean_metrics", type=str2bool, default=True)
-    parser.add_argument("--use_geometric_cap", type=str2bool, default=False)
-    parser.add_argument("--use_geometric_dap", type=str2bool, default=False)
-    parser.add_argument("--num_geometric_abnormal_prompts", type=int, default=10)
+    parser.add_argument("--save_sample_scores", type=str2bool, default=True)
     parser.add_argument("--num_normal_tokens", type=int, default=4)
     parser.add_argument("--num_abnormal_tokens", type=int, default=4)
-    parser.add_argument("--geometric_prompt_suffix", default="a point cloud patch of {article} {category}")
-    parser.add_argument("--top_m_abnormal_patches", type=int, default=10)
-    parser.add_argument("--prior_hidden_dim", type=int, default=512)
-    parser.add_argument("--patch_geo_desc_dim", type=int, default=4)
-    parser.add_argument("--geometry_graph_dim", type=int, default=128)
-    parser.add_argument("--geometry_graph_k", type=int, default=8)
-    parser.add_argument("--geometry_graph_layers", type=int, default=2)
-    parser.add_argument("--geometry_routing_temperature", type=float, default=0.2)
-    parser.add_argument("--use_geometric_mode_prompt", type=str2bool, default=False)
+    parser.add_argument("--use_static_prompt", type=str2bool, default=False)
     parser.add_argument("--use_category_prompt", type=str2bool, default=True)
     parser.add_argument("--prompt_template", default="a point cloud patch of a {category}")
-    parser.add_argument("--num_geometric_modes", type=int, default=10)
-    parser.add_argument("--mode_router_temperature", type=float, default=0.2)
-    parser.add_argument("--mode_score_type", choices=("weighted_sum", "logsumexp", "max"), default="weighted_sum")
-    parser.add_argument("--mode_score_temperature", type=float, default=0.1)
-    parser.add_argument("--mode_residual_scale", type=float, default=0.1)
-    parser.add_argument("--mode_prompt_hidden_dim", type=int, default=512)
-    parser.add_argument("--use_mode_specific_residual", type=str2bool, default=True)
-    parser.add_argument("--use_mode_weighted_scoring", type=str2bool, default=True)
-    parser.add_argument("--use_patch_mode_routing", type=str2bool, default=True)
-    parser.add_argument("--mode_anomaly_patch_threshold", type=float, default=0.05)
-    parser.add_argument("--geometric_mode_version", default="se3_mode_prompt_v7_gate_sinkhorn")
-    parser.add_argument("--use_geometry_abnormal_gate", type=str2bool, default=False)
-    parser.add_argument("--geometry_gate_logit_scale", type=float, default=1.0)
-    parser.add_argument("--lambda_geometry_invariance", type=float, default=0.1)
-    parser.add_argument("--lambda_prompt_orthogonal", type=float, default=0.1)
-    parser.add_argument("--lambda_prior", type=float, default=0.1)
+    parser.add_argument("--num_abnormal_prompts", type=int, default=6)
+    parser.add_argument("--prompt_score_temperature", type=float, default=0.07)
+    parser.add_argument("--static_prompt_version", default="static_six_prompt_v1")
+    parser.add_argument("--residual_prompt_enabled", type=str2bool, default=False)
+    parser.add_argument("--residual_num_bases", type=int, default=1)
+    parser.add_argument("--residual_gamma", type=float, default=1.0)
+    parser.add_argument("--residual_eps", type=float, default=1e-6)
+    parser.add_argument("--patch_anomaly_threshold", type=float, default=0.05)
+    parser.add_argument(
+        "--object_pooling_mode",
+        choices=("legacy", "top_mean", "top_max", "global_patch_fusion"),
+        default="legacy",
+    )
+    parser.add_argument("--object_top_ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--source_validation_top_ratios",
+        type=float,
+        nargs="+",
+        default=[0.005, 0.01, 0.05, 0.2],
+    )
     parser.add_argument("--freeze_plm", type=str2bool, default=True)
     parser.add_argument("--freeze_text_encoder", type=str2bool, default=True)
     parser.add_argument("--freeze_visual_adapter", type=str2bool, default=True)
+    parser.add_argument(
+        "--required_visual_adapter_training_mode",
+        choices=("any", "fused_only"),
+        default="any",
+    )
     parser.add_argument("--baseline_checkpoint")
+    parser.add_argument("--prompt_checkpoint")
     return parser
 
 
@@ -134,13 +149,38 @@ def parse_args():
     first = argparse.ArgumentParser(add_help=False)
     first.add_argument("--config", default=DEFAULT_CONFIG)
     config_args, _ = first.parse_known_args()
-    config = load_yaml(config_args.config)
+    config = flatten_residual_prompt_config(load_yaml(config_args.config))
+    assert_no_forbidden_config_keys(config, config_args.config)
     parser = build_parser()
     recognized = {action.dest for action in parser._actions}
-    parser.set_defaults(**{key: value for key, value in config.items() if key in recognized})
+    parser.set_defaults(
+        **{key: value for key, value in config.items() if key in recognized}
+    )
     args = parser.parse_args()
-    if not args.train_category:
-        parser.error("--train_category is required")
+    try:
+        args.train_categories = normalize_train_categories(
+            args.dataset_name, args.train_category, args.train_categories
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    args.train_category = category_run_name(args.train_categories)
+    if args.num_abnormal_prompts <= 0:
+        parser.error("num_abnormal_prompts must be positive")
+    if args.prompt_score_temperature <= 0:
+        parser.error("prompt_score_temperature must be positive")
+    if args.residual_prompt_enabled:
+        if not args.use_static_prompt:
+            parser.error("NCRP requires frozen text Prompt evaluation")
+        if args.residual_num_bases != 1:
+            parser.error("NCRP-K1 requires exactly one residual vector")
+        if args.residual_gamma < 0 or args.residual_eps <= 0:
+            parser.error("NCRP gamma must be non-negative and eps positive")
+        if args.object_pooling_mode != "top_mean" or args.object_top_ratio != 0.2:
+            parser.error("NCRP v1 fixes top_mean ratio to 0.2")
+        if args.global_alpha != 0.0:
+            parser.error("NCRP v1 fixes global_alpha=0")
+    if not 0 < args.object_top_ratio <= 1:
+        parser.error("object_top_ratio must be in (0, 1]")
     validate_one_rest_flags(args)
     return args
 
@@ -156,103 +196,478 @@ def subset_per_category(dataset, limit):
     return Subset(dataset, selected)
 
 
-def build_prompt_modules(args, encoder, checkpoint, device):
-    if not checkpoint.get("use_geometric_cap", False):
-        return None, None
-    prompt = GeometricCompoundPromptLearner(
-        encoder.open_clip_model,
-        encoder.tokenizer,
-        args.num_geometric_abnormal_prompts,
-        args.num_normal_tokens,
-        args.num_abnormal_tokens,
-        args.geometric_prompt_suffix,
-    ).to(device)
-    prompt.load_state_dict(checkpoint["geometric_cap"])
-    prompt.eval()
-    prior = None
-    if checkpoint.get("use_geometric_dap", False):
-        prior = PointCloudAbnormalityPrior(
-            feature_dim=args.text_dim,
-            text_dim=args.text_dim,
-            prompt_token_dim=prompt.token_width,
-            graph_dim=args.geometry_graph_dim,
-            hidden_dim=args.prior_hidden_dim,
-            graph_k=args.geometry_graph_k,
-            graph_layers=args.geometry_graph_layers,
-            routing_temperature=args.geometry_routing_temperature,
-            top_m=args.top_m_abnormal_patches,
-        ).to(device)
-        prior.load_state_dict(checkpoint["geometric_dap"])
-        prior.eval()
-    return prompt, prior
+LEGACY_STATIC_PROMPT_VERSION = "static_six_mode_prompt_v7_uniform_scoring"
+LEGACY_NCRP_K1_VERSION = "ncrp_a1_k1_single_residual"
 
 
-def build_geometric_mode_model(args, encoder, checkpoint, device):
-    if not checkpoint.get("use_geometric_mode_prompt", False):
+def checkpoint_uses_static_prompt(checkpoint):
+    """Recognize current checkpoints and the completed legacy static run."""
+    if "use_static_prompt" in checkpoint:
+        return bool(checkpoint["use_static_prompt"])
+    return (
+        checkpoint.get("geometric_mode_version")
+        == LEGACY_STATIC_PROMPT_VERSION
+    )
+
+
+def checkpoint_static_prompt_state(checkpoint):
+    if "residual_prompt" in checkpoint:
+        return checkpoint["residual_prompt"]
+    if "static_prompt" in checkpoint:
+        return checkpoint["static_prompt"]
+    if "geometric_mode_prompt" in checkpoint:
+        return checkpoint["geometric_mode_prompt"]
+    raise RuntimeError("Checkpoint does not contain static Prompt weights")
+
+
+def build_static_prompt_model(args, encoder, checkpoint, device):
+    if not checkpoint_uses_static_prompt(checkpoint):
         return None
-    if checkpoint.get("geometric_mode_version") != args.geometric_mode_version:
-        raise RuntimeError("Checkpoint geometric mode prompting version is incompatible")
+    checkpoint_version = checkpoint.get(
+        "static_prompt_version",
+        checkpoint.get("geometric_mode_version"),
+    )
+    if checkpoint_version not in {
+        args.static_prompt_version,
+        LEGACY_STATIC_PROMPT_VERSION,
+        LEGACY_NCRP_K1_VERSION,
+    }:
+        raise RuntimeError(
+            "Checkpoint Prompt-learning version is incompatible"
+        )
     if checkpoint.get("prompt_template") != args.prompt_template:
         raise RuntimeError("Checkpoint prompt_template does not match config")
-    model = GeometricModePromptLearner(
-        clip_model=encoder.open_clip_model,
-        tokenizer=encoder.tokenizer,
-        num_modes=checkpoint.get("num_geometric_modes", args.num_geometric_modes),
-        num_normal_tokens=args.num_normal_tokens,
-        num_abnormal_tokens=args.num_abnormal_tokens,
-        prompt_template=args.prompt_template,
-        use_category_prompt=checkpoint.get("use_category_prompt", args.use_category_prompt),
-        graph_dim=args.geometry_graph_dim,
-        graph_k=args.geometry_graph_k,
-        graph_layers=args.geometry_graph_layers,
-        router_temperature=args.mode_router_temperature,
-        residual_scale=args.mode_residual_scale,
-        modulator_hidden_dim=args.mode_prompt_hidden_dim,
-        use_mode_specific_residual=args.use_mode_specific_residual,
-    ).to(device)
-    load_result = model.load_state_dict(
-        checkpoint["geometric_mode_prompt"], strict=False
-    )
-    if args.geometric_mode_version != "se3_mode_prompt_v6_patch_routing":
-        if load_result.missing_keys or load_result.unexpected_keys:
-            raise RuntimeError(
-                f"Checkpoint state mismatch: missing={load_result.missing_keys}, "
-                f"unexpected={load_result.unexpected_keys}"
-            )
-    else:
-        invalid_missing = [
-            key for key in load_result.missing_keys
-            if not key.startswith("mode_router.abnormal_gate.")
-        ]
-        if invalid_missing or load_result.unexpected_keys:
-            raise RuntimeError(
-                f"Legacy v6 checkpoint state mismatch: missing={invalid_missing}, "
-                f"unexpected={load_result.unexpected_keys}"
-            )
+    checkpoint_residual = bool(checkpoint.get("residual_prompt_enabled", False))
+    if checkpoint_residual != bool(args.residual_prompt_enabled):
+        raise RuntimeError("Checkpoint residual_prompt_enabled mismatch")
+    if checkpoint_residual:
+        if int(checkpoint.get("residual_num_bases", 1)) != 1:
+            raise RuntimeError("Only NCRP-K1 checkpoints are supported")
+        model = NormalCenteredResidualPromptLearner(
+            clip_model=encoder.open_clip_model,
+            tokenizer=encoder.tokenizer,
+            num_bases=int(checkpoint.get("residual_num_bases", args.residual_num_bases)),
+            num_normal_tokens=args.num_normal_tokens,
+            prompt_template=args.prompt_template,
+            use_category_prompt=checkpoint.get(
+                "use_category_prompt", args.use_category_prompt
+            ),
+            gamma=float(checkpoint.get("residual_gamma", args.residual_gamma)),
+            eps=float(checkpoint.get("residual_eps", args.residual_eps)),
+        ).to(device)
+        model.load_state_dict(checkpoint_static_prompt_state(checkpoint), strict=True)
+        model.eval()
+        return model
+    common_kwargs = {
+        "clip_model": encoder.open_clip_model,
+        "tokenizer": encoder.tokenizer,
+        "num_prompts": checkpoint.get(
+            "num_abnormal_prompts",
+            checkpoint.get("num_geometric_modes", args.num_abnormal_prompts),
+        ),
+        "num_normal_tokens": args.num_normal_tokens,
+        "num_abnormal_tokens": args.num_abnormal_tokens,
+        "prompt_template": args.prompt_template,
+        "use_category_prompt": checkpoint.get(
+            "use_category_prompt", args.use_category_prompt
+        ),
+    }
+    model = StaticPromptLearner(**common_kwargs).to(device)
+    model.load_state_dict(checkpoint_static_prompt_state(checkpoint), strict=True)
     model.eval()
     return model
+
+
+def forward_prompt_scores(
+    args,
+    adapter,
+    layer_tokens,
+    global_embeddings,
+    prompt_model,
+    clip_model,
+    object_names,
+):
+    if args.residual_prompt_enabled:
+        return forward_ncrp_k1_scores(
+            adapter,
+            layer_tokens,
+            global_embeddings,
+            prompt_model,
+            clip_model,
+            object_names,
+            temperature=args.temperature,
+        )
+    return forward_static_prompt_scores(
+        adapter,
+        layer_tokens,
+        global_embeddings,
+        prompt_model,
+        clip_model,
+        object_names,
+        temperature=args.temperature,
+        prompt_score_temperature=args.prompt_score_temperature,
+    )
+
+
+def configurable_object_probability_numpy(
+    global_logits,
+    patch_probabilities,
+    mode,
+    top_ratio,
+    global_alpha,
+):
+    if mode not in {"top_mean", "top_max", "global_patch_fusion"}:
+        raise ValueError(f"Unsupported object pooling mode: {mode}")
+    if not 0 < top_ratio <= 1:
+        raise ValueError("top_ratio must be in (0, 1]")
+    probabilities = np.asarray(patch_probabilities, dtype=np.float64)
+    if probabilities.ndim != 2:
+        raise ValueError("patch_probabilities must have shape [N, G]")
+    if mode == "top_max":
+        return probabilities.max(axis=1)
+    local = _numpy_topk_mean(probabilities, top_ratio, largest=True)
+    if mode == "top_mean":
+        return local
+    global_logits = np.asarray(global_logits, dtype=np.float64).reshape(-1)
+    global_probability = 1.0 / (
+        1.0 + np.exp(-np.clip(global_logits, -60.0, 60.0))
+    )
+    return global_alpha * global_probability + (1.0 - global_alpha) * local
+
+
+def pool_object_scores(args, global_logits, patch_logits, patch_probabilities):
+    if args.object_pooling_mode == "legacy":
+        return object_scores_from_logits(
+            global_logits,
+            patch_logits,
+            args.global_alpha,
+            args.top_percent,
+            args.object_score_mode,
+        )
+    return configurable_object_probability(
+        global_logits,
+        patch_probabilities,
+        args.object_pooling_mode,
+        args.object_top_ratio,
+        args.global_alpha,
+    )
+
+
+def _torch_topk_mean(values, top_percent, largest=True):
+    if not 0 < top_percent <= 1:
+        raise ValueError("top_percent must be in (0, 1]")
+    count = max(1, int(values.shape[1] * top_percent))
+    return values.topk(count, dim=1, largest=largest).values.mean(dim=1)
+
+
+OBJECT_SCORE_MODES = (
+    "aggregate",
+    "topk_logit",
+    "topk_minus_mean",
+    "topk_minus_median",
+    "topk_minus_bottom_half",
+)
+
+def _numpy_topk_mean(values, top_percent, largest=True):
+    if not 0 < top_percent <= 1:
+        raise ValueError("top_percent must be in (0, 1]")
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("values must have shape [N, G]")
+    count = max(1, int(values.shape[1] * top_percent))
+    if largest:
+        return np.partition(values, -count, axis=1)[:, -count:].mean(axis=1)
+    return np.partition(values, count - 1, axis=1)[:, :count].mean(axis=1)
+
+
+def aggregate_object_probability_numpy(global_logits, patch_logits, global_alpha=0.5, top_percent=0.2):
+    if not 0.0 <= global_alpha <= 1.0:
+        raise ValueError("global_alpha must be in [0, 1]")
+    if not 0 < top_percent <= 1:
+        raise ValueError("top_percent must be in (0, 1]")
+    global_logits = np.asarray(global_logits, dtype=np.float64).reshape(-1)
+    patch_logits = np.asarray(patch_logits, dtype=np.float64)
+    if patch_logits.ndim != 2 or patch_logits.shape[0] != global_logits.shape[0]:
+        raise ValueError("patch_logits must have shape [N, G]")
+    global_prob = 1.0 / (1.0 + np.exp(-np.clip(global_logits, -60.0, 60.0)))
+    patch_prob = 1.0 / (1.0 + np.exp(-np.clip(patch_logits, -60.0, 60.0)))
+    local_prob = _numpy_topk_mean(patch_prob, top_percent, largest=True)
+    return global_alpha * global_prob + (1.0 - global_alpha) * local_prob
+
+
+def object_scores_from_logits_numpy(global_logits, patch_logits, global_alpha, top_percent, mode):
+    if mode == "aggregate":
+        return aggregate_object_probability_numpy(global_logits, patch_logits, global_alpha, top_percent)
+    if mode not in OBJECT_SCORE_MODES:
+        raise ValueError(f"Unsupported object_score_mode: {mode}")
+    patch_logits = np.asarray(patch_logits, dtype=np.float64)
+    top_scores = _numpy_topk_mean(patch_logits, top_percent, largest=True)
+    if mode == "topk_logit":
+        return top_scores
+    if mode == "topk_minus_mean":
+        return top_scores - patch_logits.mean(axis=1)
+    if mode == "topk_minus_median":
+        return top_scores - np.median(patch_logits, axis=1)
+    if mode == "topk_minus_bottom_half":
+        return top_scores - _numpy_topk_mean(patch_logits, 0.5, largest=False)
+    raise ValueError(f"Unsupported object_score_mode: {mode}")
+
+
+
+def object_scores_from_logits(global_logits, patch_logits, global_alpha, top_percent, mode):
+    if mode == "aggregate":
+        return aggregate_object_probability(global_logits, patch_logits, global_alpha, top_percent)
+    top_scores = _torch_topk_mean(patch_logits, top_percent, largest=True)
+    if mode == "topk_logit":
+        return top_scores
+    if mode == "topk_minus_mean":
+        return top_scores - patch_logits.mean(dim=1)
+    if mode == "topk_minus_median":
+        return top_scores - patch_logits.median(dim=1).values
+    if mode == "topk_minus_bottom_half":
+        return top_scores - _torch_topk_mean(patch_logits, 0.5, largest=False)
+    raise ValueError(f"Unsupported object_score_mode: {mode}")
+
+
+def v7_fused_point_scores(patch_logits, patch_indices, num_points):
+    return patch_to_point(patch_logits, patch_indices, num_points)
+
+
+
+def resolve_sweep_top_percent(args):
+    if args.sweep_top_percent:
+        values = args.sweep_top_percent
+    elif args.object_pooling_mode != "legacy":
+        values = args.source_validation_top_ratios
+    else:
+        values = [
+            0.000001, 0.00001, 0.0001, 0.0005,
+            0.001, 0.002, 0.005, 0.01, 0.02,
+            0.05, 0.1, 0.2, 0.3, 0.5, 1.0,
+        ]
+    valid = sorted({float(value) for value in values if 0 < float(value) <= 1})
+    if not valid:
+        raise ValueError("sweep_top_percent must contain at least one value in (0, 1]")
+    return valid
+
+
+
+def _finite_metric(value):
+    if value is None:
+        return None
+    value = float(value)
+    return value if np.isfinite(value) else None
+
+
+def normal_false_positive_gap(labels, scores):
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    normal = scores[labels <= 0]
+    anomaly = scores[labels > 0]
+    if normal.size == 0 or anomaly.size == 0:
+        return None
+    return float(np.quantile(normal, 0.95) - np.quantile(anomaly, 0.50))
+
+
+def _label_score_mean(labels, scores, positive):
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    mask = labels > 0 if positive else labels <= 0
+    selected = scores[mask]
+    if selected.size == 0:
+        return None
+    return float(selected.mean())
+
+
+def build_diagnostic_metrics(args, run_dir, feature_layers, means, best_by_auroc, sample_values):
+    object_labels = np.asarray(sample_values["object_label"], dtype=np.int64)
+    object_scores = np.asarray(sample_values["object_score"], dtype=np.float64)
+    object_auroc = _finite_metric(means.get("object_auroc"))
+    point_auroc = _finite_metric(means.get("point_auroc"))
+    metrics = {
+        "task_name": (
+            "ncrp"
+            if args.residual_prompt_enabled
+            else "static_six_prompt"
+        ),
+        "layer_set": run_dir.name,
+        "layers": list(feature_layers),
+        "train_category": args.train_category,
+        "dataset_name": args.test_dataset_name or args.dataset_name,
+        "source_dataset_name": args.dataset_name,
+        "object_auroc": object_auroc,
+        "point_auroc": point_auroc,
+        "best_top_p": _finite_metric(best_by_auroc.get("top_percent")),
+        "best_top_p_object_auroc": _finite_metric(best_by_auroc.get("object_auroc")),
+        "normal_false_positive_gap": normal_false_positive_gap(object_labels, object_scores),
+        "mean_point_object_gap": (
+            point_auroc - object_auroc
+            if object_auroc is not None and point_auroc is not None else None
+        ),
+        "normal_object_score_mean": _label_score_mean(object_labels, object_scores, positive=False),
+        "anomaly_object_score_mean": _label_score_mean(object_labels, object_scores, positive=True),
+        "object_score_mode": args.object_score_mode,
+        "top_percent": args.top_percent,
+        "global_alpha": args.global_alpha,
+    }
+    return metrics
+
+
+def _fmt_metric(value):
+    value = _finite_metric(value)
+    return "NA" if value is None else f"{value:.6f}"
+
+
+def _distribution_stats(values):
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {"mean": None, "std": None, "median": None, "p95": None}
+    return {
+        "mean": float(values.mean()),
+        "std": float(values.std()),
+        "median": float(np.median(values)),
+        "p95": float(np.quantile(values, 0.95)),
+    }
+
+
+def build_ncrp_diagnostics(
+    args,
+    checkpoint,
+    checkpoint_path,
+    means,
+    sample_values,
+    parameter_counts,
+    test_time_seconds,
+    inference_time_seconds,
+    peak_gpu_memory_bytes,
+):
+    """Build diagnostics for the maintained single-residual NCRP-K1 method."""
+    completion_path = Path(checkpoint_path).parent / "training_complete.yaml"
+    completion = load_yaml(completion_path) if completion_path.is_file() else {}
+    assignments = np.stack(sample_values["basis_assignments"], axis=0).astype(
+        np.float64, copy=False
+    )
+    residual_norms = np.stack(sample_values["residual_norms"], axis=0).astype(
+        np.float64, copy=False
+    )
+    patch_labels = np.stack(sample_values["patch_labels"], axis=0).astype(bool)
+    patch_logits = np.stack(sample_values["patch_logits"], axis=0).astype(
+        np.float64, copy=False
+    )
+    usage = assignments.mean(axis=(0, 1))
+    usage = usage / max(float(usage.sum()), args.residual_eps)
+    normal_mask = ~patch_labels
+    anomaly_mask = patch_labels
+    gram_samples = np.stack(sample_values["basis_gram_matrix"], axis=0)
+    gram = gram_samples.mean(axis=0)
+    offdiag = gram[~np.eye(gram.shape[0], dtype=bool)]
+    categories = np.asarray(sample_values["category_name"], dtype=str)
+    per_category_usage = {}
+    for category in sorted(set(categories.tolist())):
+        per_category_usage[category] = assignments[categories == category].mean(
+            axis=(0, 1)
+        ).tolist()
+    training = (checkpoint.get("training_statistics") or {}).get("ncrp") or {}
+    diagnostics = {
+        "method": "Normal-Centered Residual Prompting (NCRP-K1)",
+        "version": checkpoint.get("static_prompt_version"),
+        "num_bases": 1,
+        "basis_usage": usage.tolist(),
+        "assignment_entropy": None,
+        "normalized_assignment_entropy": None,
+        "assignment_diagnostics_status": "not_applicable_single_basis",
+        "basis_usage_status": "structural_single_basis",
+        "max_basis_usage": float(usage.max()),
+        "max_assignment_weight_mean": float(assignments.max(axis=-1).mean()),
+        "basis_gram_matrix": gram.tolist(),
+        "basis_gram_off_diagonal_mean": (
+            float(np.abs(offdiag).mean()) if offdiag.size else 0.0
+        ),
+        "basis_normal_anchor_max_abs_inner_product": (
+            float(max(sample_values["basis_normal_max_abs_inner_product"]))
+            if sample_values["basis_normal_max_abs_inner_product"]
+            else None
+        ),
+        "normal_patch_residual_norm": _distribution_stats(residual_norms[normal_mask]),
+        "anomaly_patch_residual_norm": _distribution_stats(residual_norms[anomaly_mask]),
+        # Retained as explicit N/A fields for artifact-schema compatibility.
+        "normal_max_basis_alignment": None,
+        "anomaly_coverage_cosine": None,
+        "normal_patch_logit_statistics": _distribution_stats(patch_logits[normal_mask]),
+        "anomaly_patch_logit_statistics": _distribution_stats(patch_logits[anomaly_mask]),
+        "per_target_category_basis_usage": per_category_usage,
+        "trainable_parameter_count": int(parameter_counts),
+        "prompt_parameter_counts": checkpoint.get("prompt_parameter_counts"),
+        "checkpoint_size_bytes": Path(checkpoint_path).stat().st_size,
+        "training_time_seconds": completion.get(
+            "training_time_seconds", checkpoint.get("training_time_seconds")
+        ),
+        "test_time_seconds": float(test_time_seconds),
+        "mean_inference_time_per_sample_seconds": float(
+            inference_time_seconds / max(1, len(sample_values["path"]))
+        ),
+        "peak_gpu_memory_bytes": int(peak_gpu_memory_bytes),
+        "gamma": args.residual_gamma,
+        "training_curve": training.get("training_curve", []),
+        "seed": args.seed,
+        "checkpoint_seed": checkpoint.get("seed"),
+        "checkpoint_path": str(checkpoint_path),
+        "used_target_test_for_training": False,
+        "used_target_test_for_hyperparameter_selection": False,
+    }
+    return diagnostics
 
 
 @torch.inference_mode()
 def main():
     args = parse_args()
-    train_categories, test_categories = resolve_categories(
-        args.dataset_name, args.protocol, args.train_category
+    test_started = time.perf_counter()
+    seed_report = seed_everything(args.seed, num_workers=args.num_workers)
+    train_categories, same_dataset_test_categories = resolve_categories(
+        args.dataset_name, args.protocol, train_categories=args.train_categories
     )
-    run_dir = Path(args.output_root) / args.train_category
+    test_dataset_name = args.test_dataset_name or args.dataset_name
+    cross_dataset = test_dataset_name != args.dataset_name
+    test_categories = (
+        list(PointCloudDataset.PRESETS[test_dataset_name])
+        if cross_dataset else same_dataset_test_categories
+    )
+    test_data_root = args.test_data_root or args.data_root
+    checkpoint_run_dir = Path(args.output_root) / args.train_category
+    run_dir = Path(args.output_dir) if args.output_dir else checkpoint_run_dir
     run_dir.mkdir(parents=True, exist_ok=True)
     test_log = run_dir / "test.log"
     test_log.write_text("", encoding="utf-8")
     log_line(test_log, f"Protocol: {args.protocol}")
+    log_line(test_log, f"Source dataset: {args.dataset_name}")
+    log_line(test_log, f"Test dataset: {test_dataset_name}")
     log_line(test_log, f"Train categories: {train_categories}")
     log_line(test_log, f"Test categories: {test_categories}")
+    log_line(test_log, f"Seed report: {seed_report}")
+    sweep_top_percent = resolve_sweep_top_percent(args)
+    log_line(test_log, f"Object score mode: {args.object_score_mode}")
+    log_line(test_log, f"Object top_p sweep: {sweep_top_percent}")
+    log_line(
+        test_log,
+        f"Object pooling={args.object_pooling_mode}"
+        f" | top_ratio={args.object_top_ratio}"
+        f" | global_alpha={args.global_alpha}",
+    )
     dataset = PointCloudDataset(
-        args.data_root, split=args.test_split, classes=test_categories,
-        dataset_name=args.dataset_name,
+        test_data_root, split=args.test_split, classes=test_categories,
+        dataset_name=test_dataset_name,
     )
     if len(dataset) == 0:
         raise FileNotFoundError("No target test samples")
-    observed = assert_dataset_categories(dataset, test_categories, train_categories)
+    forbidden_categories = (
+        train_categories
+        if not cross_dataset
+        and args.protocol == "one_rest"
+        and args.exclude_train_category_from_test
+        else ()
+    )
+    observed = assert_dataset_categories(dataset, test_categories, forbidden_categories)
     log_line(test_log, f"Observed test path categories: {observed}")
     limit = args.max_test_samples_per_category
     if args.debug:
@@ -262,64 +677,93 @@ def main():
         subset_per_category(dataset, limit), batch_size=args.batch_size,
         shuffle=False, drop_last=False, num_workers=args.num_workers,
         pin_memory=args.device == "cuda",
+        **dataloader_seed_kwargs(args.seed),
     )
 
-    checkpoint_path = Path(args.checkpoint) if args.checkpoint else run_dir / "best.pth"
+    checkpoint_path = Path(args.checkpoint) if args.checkpoint else checkpoint_run_dir / "best.pth"
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     device = "cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if checkpoint.get("train_category") != args.train_category:
-        raise RuntimeError("Checkpoint train_category mismatch")
+    if checkpoint_train_categories(checkpoint) != args.train_categories:
+        raise RuntimeError("Checkpoint train_categories mismatch")
     if "feature_layers" not in checkpoint:
         raise RuntimeError(
             "Checkpoint uses the old single-layer adapter; retrain with feature_layers=[2,5,8,11]"
         )
-    use_cap = checkpoint.get("use_geometric_cap", False)
-    use_dap = checkpoint.get("use_geometric_dap", False)
-    use_mode_prompt = checkpoint.get("use_geometric_mode_prompt", False)
-    if use_mode_prompt and (use_cap or use_dap):
-        raise RuntimeError("Checkpoint mixes legacy CAP/DAP with geometric mode prompting")
-    if use_cap and checkpoint.get("prompt_suffix_mode") != "prompt_template_v1":
+    visual_source_training_mode = (
+        checkpoint.get("visual_source_training_mode")
+        or checkpoint.get("visual_adapter_training_mode")
+        or "fused_only"
+    )
+    if (
+        args.required_visual_adapter_training_mode != "any"
+        and visual_source_training_mode
+        != args.required_visual_adapter_training_mode
+    ):
         raise RuntimeError(
-            "Checkpoint prompt suffix mode is incompatible; retrain with the current prompt template implementation"
+            "Visual adapter training mode mismatch: "
+            f"required={args.required_visual_adapter_training_mode}, "
+            f"checkpoint={visual_source_training_mode}"
         )
-    if use_cap and checkpoint.get("geometric_prompt_suffix") != args.geometric_prompt_suffix:
-        raise RuntimeError("Checkpoint geometric prompt template does not match config")
-    if use_dap and checkpoint.get("dap_version") != "se3_graph_v1":
-        raise RuntimeError(
-            "Checkpoint uses the old 4D/top-M DAP; retrain with the SE(3) graph configuration"
-        )
-    if use_mode_prompt:
-        log_line(test_log, "GeometricModePrompt=True")
+    log_line(
+        test_log,
+        f"Visual adapter training mode: {visual_source_training_mode}",
+    )
+    checkpoint_feature_layers = list(checkpoint.get("feature_layers", args.feature_layers))
+    feature_layers = checkpoint_feature_layers
+    args.return_layers = list(feature_layers)
+    args.feature_layers = list(feature_layers)
+    log_line(test_log, f"Checkpoint PointBERT feature_layers: {checkpoint_feature_layers}")
+    log_line(test_log, f"Evaluation PointBERT feature_layers: {feature_layers}")
+    use_static_prompt = checkpoint_uses_static_prompt(checkpoint)
+    if use_static_prompt:
+        if args.residual_prompt_enabled:
+            log_line(test_log, "Prompt learner=NCRP")
+            log_line(test_log, f"Learnable residual bases={args.residual_num_bases}")
+        else:
+            prompt_count = checkpoint.get(
+                "num_abnormal_prompts",
+                checkpoint.get("num_geometric_modes", args.num_abnormal_prompts),
+            )
+            log_line(test_log, "StaticPromptLearner=True")
+            log_line(test_log, f"Learnable abnormal Prompts={prompt_count}")
         log_line(test_log, f"Prompt template: {args.prompt_template}")
     else:
-        log_line(test_log, f"Geometric CAP={use_cap}, DAP={use_dap}")
+        log_line(test_log, "Stage 1: trainable multi-layer visual baseline")
     encoder = ULIP2Encoder(
         args.model_path, device=device, num_points=args.num_points,
-        return_layers=tuple(args.return_layers), return_clip=use_cap or use_mode_prompt,
+        return_layers=tuple(args.return_layers), return_clip=use_static_prompt,
     )
-    feature_layers = checkpoint.get("feature_layers", args.feature_layers)
     adapter = MultiLayerPatchAdapter(
         checkpoint.get("token_dim", args.token_dim),
         checkpoint.get("text_dim", args.text_dim),
-        len(feature_layers),
+        len(checkpoint_feature_layers),
     ).to(device)
     adapter.load_state_dict(checkpoint["adapter"])
     adapter.eval()
-    prompt_learner, prior_network = build_prompt_modules(args, encoder, checkpoint, device)
-    mode_prompt_model = build_geometric_mode_model(args, encoder, checkpoint, device)
-    if prompt_learner is None and mode_prompt_model is None:
+    prompt_model = build_static_prompt_model(args, encoder, checkpoint, device)
+    trainable_parameter_count = (
+        sum(parameter.numel() for parameter in prompt_model.parameters())
+        if prompt_model is not None
+        else sum(parameter.numel() for parameter in adapter.parameters())
+    )
+    if prompt_model is None:
         fixed_normal = encoder.encode_text_templates(args.normal_templates)
         fixed_anomaly = encoder.encode_text_templates(args.anomaly_templates)
     else:
         fixed_normal = fixed_anomaly = None
 
     values = defaultdict(lambda: defaultdict(list))
-    mode_values = defaultdict(lambda: defaultdict(list))
-    category_names = PointCloudDataset.PRESETS[args.dataset_name]
-    feature_layers = checkpoint.get("feature_layers", args.feature_layers)
+    sample_values = defaultdict(list)
+    inference_time_seconds = 0.0
+    category_names = PointCloudDataset.PRESETS[test_dataset_name]
     for batch in tqdm(loader, desc=f"Test source={args.train_category}", dynamic_ncols=True):
+        if device == "cuda":
+            torch.cuda.synchronize()
+        inference_started = time.perf_counter()
         points = batch["points"].to(device, non_blocking=True)
         labels = batch["labels"]
         object_names = [category_names[int(category)] for category in batch["category"]]
@@ -327,54 +771,21 @@ def main():
         tokens = select_multi_layer_tokens(
             features["layer_feats"], features["patch_idx"], feature_layers
         )
-        patch_embeddings = adapter(tokens)
-        batch_mode_weights = batch_mode_entropy = batch_delta_norm = None
-        batch_node_weights = batch_patch_targets = batch_gate_probabilities = None
-        if mode_prompt_model is not None:
-            geometry = mode_prompt_model.forward_geometry(points, features["patch_idx"])
-            patch_gate_logits = (
-                geometry["abnormal_gate_logits"]
-                if args.use_geometry_abnormal_gate else None
+        if prompt_model is not None:
+            score_output = forward_prompt_scores(
+                args,
+                adapter,
+                tokens,
+                features["concat"],
+                prompt_model,
+                encoder.open_clip_model,
+                object_names,
             )
-            gate_top_count = max(
-                1, int(geometry["abnormal_gate_logits"].shape[1] * args.top_percent)
-            )
-            sample_gate_logits = (
-                geometry["abnormal_gate_logits"].topk(
-                    gate_top_count, dim=1
-                ).values.mean(dim=1)
-                if args.use_geometry_abnormal_gate else None
-            )
-            mode_prompts = encode_geometric_mode_prompts(
-                mode_prompt_model, encoder.open_clip_model, object_names, geometry["delta_A"]
-            )
-            patch_logits = mode_aware_anomaly_logits(
-                patch_embeddings, mode_prompts["normal_text_embed"],
-                mode_prompts["dynamic_abnormal_text_embeds"], (geometry["node_mode_weights"] if args.use_patch_mode_routing else geometry["mode_weights"]),
-                args.temperature, args.mode_score_type, args.use_mode_weighted_scoring,
-                args.mode_score_temperature, patch_gate_logits,
-                args.geometry_gate_logit_scale,
-            )
-            global_logits = mode_aware_anomaly_logits(
-                features["concat"].unsqueeze(1), mode_prompts["normal_text_embed"],
-                mode_prompts["dynamic_abnormal_text_embeds"], geometry["mode_weights"],
-                args.temperature, args.mode_score_type, args.use_mode_weighted_scoring,
-                args.mode_score_temperature, sample_gate_logits,
-                args.geometry_gate_logit_scale,
-            ).squeeze(1)
-            patch_targets, _ = point_mask_to_patch_targets(
-                labels.to(device), features["patch_idx"], args.mode_anomaly_patch_threshold
-            )
-            batch_node_weights = geometry["node_mode_weights"].cpu().numpy()
-            batch_patch_targets = patch_targets.cpu().numpy()
-            batch_gate_probabilities = (
-                geometry["abnormal_gate_logits"].sigmoid().cpu().numpy()
-                if args.use_geometry_abnormal_gate else None
-            )
-            batch_mode_weights = geometry["mode_weights"].cpu().numpy()
-            batch_mode_entropy = normalized_mode_entropy(geometry["mode_weights"]).cpu().numpy()
-            batch_delta_norm = geometry["delta_A"].norm(dim=-1).mean(dim=(1, 2)).cpu().numpy()
-        elif prompt_learner is None:
+            patch_embeddings = score_output["patch_embeddings"]
+            patch_logits = score_output["patch_logits"]
+            global_logits = score_output["global_logits"]
+        else:
+            patch_embeddings = adapter(tokens)
             patch_logits = patch_text_logits(
                 patch_embeddings, fixed_normal, fixed_anomaly, args.temperature
             )
@@ -384,56 +795,151 @@ def main():
                 fixed_anomaly,
                 args.temperature,
             ).squeeze(1)
-        else:
-            base_prompts = encode_geometric_prompts(
-                prompt_learner, encoder.open_clip_model, object_names=object_names
-            )
-            dynamic_proto = None
-            if prior_network is not None:
-                prior_result = prior_network(
-                    patch_embeddings, base_prompts["normal_text_embed"],
-                    base_prompts["abnormal_text_proto"], points,
-                    features["patch_idx"],
-                )
-                dynamic = encode_prior_enabled_abnormal_prompts(
-                    prompt_learner, encoder.open_clip_model, prior_result["prior"],
-                    object_names=object_names,
-                )
-                dynamic_proto = dynamic["prior_enabled_abnormal_text_proto"]
-            patch_logits = geometric_anomaly_logits(
-                patch_embeddings, base_prompts["normal_text_embed"],
-                base_prompts["abnormal_text_proto"], dynamic_proto, args.temperature,
-            )
-            global_logits = geometric_anomaly_logits(
-                features["concat"].unsqueeze(1),
-                base_prompts["normal_text_embed"],
-                base_prompts["abnormal_text_proto"], dynamic_proto, args.temperature,
-            ).squeeze(1)
-        # Keep raw logits for ranking metrics. Float32 sigmoid saturates large
-        # top-k values to exactly 1.0 and creates artificial score ties.
-        point_scores = patch_to_point(
+        patch_probabilities = torch.sigmoid(patch_logits.double())
+        point_scores_tensor = patch_to_point(
             patch_logits, features["patch_idx"], labels.shape[1]
-        ).cpu().numpy()
-        object_scores = aggregate_object_probability(
-            global_logits, patch_logits, args.global_alpha, args.top_percent
-        ).cpu().numpy()
+        )
+        point_scores = point_scores_tensor.cpu().numpy()
+        object_scores_for_metrics_tensor = pool_object_scores(
+            args,
+            global_logits,
+            patch_logits,
+            patch_probabilities,
+        )
+        if device == "cuda":
+            torch.cuda.synchronize()
+        inference_time_seconds += time.perf_counter() - inference_started
+        object_scores = object_scores_for_metrics_tensor.cpu().numpy()
+        global_logit_values = global_logits.detach().cpu().numpy()
+        patch_logit_values = patch_logits.detach().cpu().numpy()
+        patch_probability_values = patch_probabilities.cpu().numpy()
+        points_for_save = points.detach().cpu().numpy()
+        if args.residual_prompt_enabled:
+            patch_anomaly_mask, _, _, _ = patch_mask_targets(
+                labels.to(device),
+                features["patch_idx"],
+                args.patch_anomaly_threshold,
+            )
+            patch_label_values = patch_anomaly_mask.detach().cpu().numpy()
+            basis_assignment_values = score_output["basis_assignments"].detach().cpu().numpy()
+            basis_similarity_values = score_output["basis_similarities"].detach().cpu().numpy()
+            residual_norm_values = score_output["residual_norms"].detach().cpu().numpy()
+            combined_norm_values = score_output[
+                "combined_residual_direction_norm"
+            ].detach().cpu().numpy()
+            directions = score_output["projected_directions"]
+            basis_gram_values = (
+                directions @ directions.transpose(-1, -2)
+            ).detach().cpu().numpy()
+            basis_normal_inner_values = score_output.get(
+                "basis_normal_max_abs_inner_product"
+            )
+            basis_normal_inner_values = (
+                basis_normal_inner_values.detach().cpu().numpy()
+                if basis_normal_inner_values is not None
+                else None
+            )
+        paths = batch.get("path", [""] * len(batch["category"]))
         for index, category in enumerate(batch["category"]):
             name = category_names[int(category)]
             point_labels = labels[index].numpy().reshape(-1)
-            values[name]["object_labels"].append(int((point_labels > 0).any()))
+            object_label = int((point_labels > 0).any())
+            values[name]["object_labels"].append(object_label)
             values[name]["object_scores"].append(float(object_scores[index]))
+            values[name]["global_logits"].append(float(global_logit_values[index]))
+            values[name]["patch_logits"].append(patch_logit_values[index].copy())
             values[name]["point_labels"].append(point_labels)
             values[name]["point_scores"].append(point_scores[index].reshape(-1))
-            if batch_mode_weights is not None:
-                mode_values[name]["weights"].append(batch_mode_weights[index])
-                mode_values[name]["entropy"].append(float(batch_mode_entropy[index]))
-                mode_values[name]["delta_norm"].append(float(batch_delta_norm[index]))
-                mode_values[name]["node_weights"].append(batch_node_weights[index])
-                mode_values[name]["patch_targets"].append(batch_patch_targets[index])
-                if batch_gate_probabilities is not None:
-                    mode_values[name]["gate_probabilities"].append(
-                        batch_gate_probabilities[index]
+            values[name]["patch_probabilities"].append(
+                patch_probability_values[index].copy()
+            )
+            sample_values["path"].append(str(paths[index]))
+            sample_values["category_name"].append(name)
+            sample_values["category_index"].append(int(category))
+            sample_values["object_label"].append(object_label)
+            sample_values["object_score"].append(float(object_scores[index]))
+            sample_values["global_logit"].append(float(global_logit_values[index]))
+            sample_values["patch_logits"].append(patch_logit_values[index].copy())
+            if args.residual_prompt_enabled:
+                sample_values["patch_labels"].append(patch_label_values[index].copy())
+                sample_values["basis_assignments"].append(
+                    basis_assignment_values[index].copy()
+                )
+                sample_values["basis_similarities"].append(
+                    basis_similarity_values[index].copy()
+                )
+                sample_values["residual_norms"].append(
+                    residual_norm_values[index].copy()
+                )
+                sample_values["combined_residual_direction_norm"].append(
+                    combined_norm_values[index].copy()
+                )
+                sample_values["basis_gram_matrix"].append(
+                    basis_gram_values[index].copy()
+                )
+                if basis_normal_inner_values is not None:
+                    sample_values["basis_normal_max_abs_inner_product"].append(
+                        float(basis_normal_inner_values[index])
                     )
+            sample_values["point_scores"].append(point_scores[index].reshape(-1).copy())
+            sample_values["point_labels"].append(point_labels.copy())
+            sample_values["points"].append(points_for_save[index].copy())
+            sample_values["patch_probabilities"].append(
+                patch_probability_values[index].copy()
+            )
+
+
+    if args.save_sample_scores:
+        score_payload = {
+            "path": np.asarray(sample_values["path"], dtype=str),
+            "category_name": np.asarray(sample_values["category_name"], dtype=str),
+            "category_index": np.asarray(sample_values["category_index"], dtype=np.int64),
+            "object_label": np.asarray(sample_values["object_label"], dtype=np.int64),
+            "object_labels": np.asarray(sample_values["object_label"], dtype=np.int64),
+            "object_score": np.asarray(sample_values["object_score"], dtype=np.float64),
+            "global_logit": np.asarray(sample_values["global_logit"], dtype=np.float64),
+            "patch_logits": np.stack(sample_values["patch_logits"], axis=0),
+            "patch_probabilities": np.stack(
+                sample_values["patch_probabilities"], axis=0
+            ),
+            "point_scores": np.stack(sample_values["point_scores"], axis=0),
+            "point_labels": np.stack(sample_values["point_labels"], axis=0),
+            "labels": np.stack(sample_values["point_labels"], axis=0),
+            "points": np.stack(sample_values["points"], axis=0),
+            "object_score_mode": np.asarray(args.object_score_mode),
+            "top_percent": np.asarray(args.top_percent, dtype=np.float64),
+            "object_top_ratio": np.asarray(args.object_top_ratio, dtype=np.float64),
+            "object_pooling_mode": np.asarray(args.object_pooling_mode),
+            "global_alpha": np.asarray(args.global_alpha, dtype=np.float64),
+            "pointbert_layers": np.asarray(feature_layers, dtype=np.int64),
+        }
+        if args.residual_prompt_enabled:
+            score_payload.update(
+                {
+                    "residual_norms": np.stack(
+                        sample_values["residual_norms"], axis=0
+                    ),
+                    "basis_assignments": np.stack(
+                        sample_values["basis_assignments"], axis=0
+                    ),
+                    "basis_similarities": np.stack(
+                        sample_values["basis_similarities"], axis=0
+                    ),
+                    "combined_residual_direction_norm": np.stack(
+                        sample_values["combined_residual_direction_norm"], axis=0
+                    ),
+                    "patch_labels": np.stack(
+                        sample_values["patch_labels"], axis=0
+                    ),
+                }
+            )
+            if sample_values["basis_normal_max_abs_inner_product"]:
+                score_payload["basis_normal_max_abs_inner_product"] = np.asarray(
+                    sample_values["basis_normal_max_abs_inner_product"],
+                    dtype=np.float64,
+                )
+        np.savez_compressed(run_dir / "sample_scores.npz", **score_payload)
+        log_line(test_log, f"Saved sample scores: {run_dir / 'sample_scores.npz'}")
 
     per_category = {}
     for name in test_categories:
@@ -450,118 +956,214 @@ def main():
         }
         log_line(test_log, f"{name}: {per_category[name]}")
 
-    mode_statistics = None
-    if mode_prompt_model is not None:
-        category_statistics = []
+    metric_names = (
+        "object_auroc", "object_ap",
+        "point_auroc", "point_ap", "point_pro",
+    )
+    means = {key: finite_mean([item.get(key) for item in per_category.values()]) for key in metric_names}
+    sweep_results = []
+    for top_percent in sweep_top_percent:
+        sweep_per_category = {}
         for name in test_categories:
-            weights = np.asarray(mode_values[name]["weights"], dtype=np.float64)
-            usage = weights.mean(axis=0) if weights.size else np.zeros(args.num_geometric_modes)
-            usage_std = weights.std(axis=0) if weights.size else np.zeros(args.num_geometric_modes)
-            node_weights = np.asarray(
-                mode_values[name]["node_weights"], dtype=np.float64
-            ).reshape(-1, args.num_geometric_modes)
-            patch_targets = np.asarray(
-                mode_values[name]["patch_targets"], dtype=bool
-            ).reshape(-1)
-            gate_probabilities = (
-                np.asarray(
-                    mode_values[name]["gate_probabilities"], dtype=np.float64
-                ).reshape(-1)
-                if args.use_geometry_abnormal_gate else np.array([], dtype=np.float64)
-            )
-            node_usage = (
-                node_weights.mean(axis=0)
-                if node_weights.size else np.zeros(args.num_geometric_modes)
-            )
-            node_entropy = float(
-                -(node_weights * np.log(np.clip(node_weights, 1e-8, None))).sum(axis=-1).mean()
-                / np.log(args.num_geometric_modes)
-            ) if node_weights.size else None
-            node_confidence = float(node_weights.max(axis=-1).mean()) if node_weights.size else None
-            anomaly_node_usage = (
-                node_weights[patch_targets].mean(axis=0)
-                if patch_targets.any() else np.zeros(args.num_geometric_modes)
-            )
-            normal_node_usage = (
-                node_weights[~patch_targets].mean(axis=0)
-                if (~patch_targets).any() else np.zeros(args.num_geometric_modes)
-            )
-            anomaly_normal_route_gap = float(
-                np.abs(anomaly_node_usage - normal_node_usage).mean()
-            ) if patch_targets.any() and (~patch_targets).any() else None
-            anomaly_gate_probability = (
-                float(gate_probabilities[patch_targets].mean())
-                if gate_probabilities.size and patch_targets.any() else None
-            )
-            normal_gate_probability = (
-                float(gate_probabilities[~patch_targets].mean())
-                if gate_probabilities.size and (~patch_targets).any() else None
-            )
-            gate_probability_gap = (
-                anomaly_gate_probability - normal_gate_probability
-                if anomaly_gate_probability is not None
-                and normal_gate_probability is not None else None
-            )
-            entropy = finite_mean(mode_values[name]["entropy"])
-            marginal_entropy = float(
-                -(usage * np.log(np.clip(usage, 1e-8, None))).sum()
-                / np.log(args.num_geometric_modes)
-            )
-            mode_information = marginal_entropy - entropy
-            delta_norm = finite_mean(mode_values[name]["delta_norm"])
-            prompt_text = mode_prompt_model.prompt_texts([name])[0]
-            item = {
-                "target_category": name,
-                "prompt_text": prompt_text,
-                "mode_usage_distribution": usage.tolist(),
-                "mode_usage_std": usage_std.tolist(),
-                "mode_entropy": entropy,
-                "mode_marginal_entropy": marginal_entropy,
-                "mode_information": mode_information,
-                "delta_A_norm_mean": delta_norm,
-                "patch_mode_usage_distribution": node_usage.tolist(),
-                "patch_mode_entropy": node_entropy,
-                "patch_mode_confidence": node_confidence,
-                "anomaly_patch_mode_usage": anomaly_node_usage.tolist(),
-                "normal_patch_mode_usage": normal_node_usage.tolist(),
-                "anomaly_normal_route_gap": anomaly_normal_route_gap,
-                "anomaly_gate_probability": anomaly_gate_probability,
-                "normal_gate_probability": normal_gate_probability,
-                "gate_probability_gap": gate_probability_gap,
+            category = values[name]
+            object_labels = category["object_labels"]
+            global_logits_np = np.asarray(category["global_logits"], dtype=np.float64)
+            patch_logits_np = np.stack(category["patch_logits"], axis=0)
+            if args.object_pooling_mode == "legacy":
+                object_scores_np = object_scores_from_logits_numpy(
+                    global_logits_np, patch_logits_np, args.global_alpha,
+                    top_percent, args.object_score_mode,
+                )
+            else:
+                patch_probabilities_np = np.stack(
+                    category["patch_probabilities"], axis=0
+                )
+                object_scores_np = configurable_object_probability_numpy(
+                    global_logits_np,
+                    patch_probabilities_np,
+                    (
+                        "global_patch_fusion"
+                        if args.object_pooling_mode == "legacy"
+                        else args.object_pooling_mode
+                    ),
+                    top_percent,
+                    args.global_alpha,
+                )
+            object_metrics = safe_binary_metrics(object_labels, object_scores_np.tolist())
+            sweep_per_category[name] = {
+                "samples": len(object_labels),
+                "object_auroc": object_metrics["auroc"],
+                "object_ap": object_metrics["ap"],
             }
-            category_statistics.append(item)
-            log_line(
-                test_log,
-                f"Mode statistics {name}: prompt={prompt_text!r}, "
-                f"usage={[round(value, 6) for value in usage.tolist()]}, "
-                f"usage_std={[round(value, 6) for value in usage_std.tolist()]}, "
-                f"conditional_entropy={entropy:.6f}, marginal_entropy={marginal_entropy:.6f}, "
-                f"mode_information={mode_information:.6f}, delta_A_norm={delta_norm:.6f}, "
-                f"patch_entropy={node_entropy:.6f}, patch_confidence={node_confidence:.6f}, "
-                f"anomaly_normal_route_gap={anomaly_normal_route_gap}, "
-                f"gate_probability_gap={gate_probability_gap}",
-            )
-        mode_statistics = {
-            "train_category": args.train_category,
-            "num_geometric_modes": args.num_geometric_modes,
-            "categories": category_statistics,
+        sweep_mean = {
+            "object_auroc": finite_mean(
+                [item["object_auroc"] for item in sweep_per_category.values()]
+            ),
+            "object_ap": finite_mean(
+                [item["object_ap"] for item in sweep_per_category.values()]
+            ),
         }
-        write_json(run_dir / "mode_statistics.json", mode_statistics)
-
-    metric_names = ("object_auroc", "object_ap", "point_auroc", "point_ap", "point_pro")
-    means = {key: finite_mean([item[key] for item in per_category.values()]) for key in metric_names}
+        sweep_results.append({
+            "top_percent": top_percent,
+            "global_alpha": args.global_alpha,
+            "object_score_mode": args.object_score_mode,
+            "object_pooling_mode": args.object_pooling_mode,
+            **sweep_mean,
+            "per_category": sweep_per_category,
+        })
+        log_line(
+            test_log,
+            f"Top-p sweep top_percent={top_percent:g}: "
+            f"object_auroc={_fmt_metric(sweep_mean['object_auroc'])}, "
+            f"object_ap={_fmt_metric(sweep_mean['object_ap'])}",
+        )
+    if args.object_pooling_mode == "legacy":
+        best_by_auroc = max(
+            sweep_results,
+            key=lambda item: item["object_auroc"] if item["object_auroc"] is not None else float("-inf"),
+        )
+        best_by_ap = max(
+            sweep_results,
+            key=lambda item: item["object_ap"] if item["object_ap"] is not None else float("-inf"),
+        )
+    else:
+        configured = min(
+            sweep_results,
+            key=lambda item: abs(item["top_percent"] - args.object_top_ratio),
+        )
+        # Never choose a new-method ratio using target-test labels. Keep this
+        # alias only for the existing diagnostic report interface.
+        best_by_auroc = configured
+        best_by_ap = configured
+    sweep_summary = {
+        "selection_policy": (
+            "diagnostic_only; final top ratio must be selected on source-only "
+            "validation, never on target-test metrics"
+        ),
+        "train_category": args.train_category,
+        "source_dataset_name": args.dataset_name,
+        "test_dataset_name": test_dataset_name,
+        "test_categories": test_categories,
+        "global_alpha": args.global_alpha,
+        "object_score_mode": args.object_score_mode,
+        "object_pooling_mode": args.object_pooling_mode,
+        "results": sweep_results,
+    }
+    if args.object_pooling_mode == "legacy":
+        sweep_summary["best_by_object_auroc"] = {
+            key: best_by_auroc[key]
+            for key in ("top_percent", "object_auroc", "object_ap")
+        }
+        sweep_summary["best_by_object_ap"] = {
+            key: best_by_ap[key]
+            for key in ("top_percent", "object_auroc", "object_ap")
+        }
+    else:
+        sweep_summary["configured_ratio_result"] = {
+            key: best_by_auroc[key]
+            for key in ("top_percent", "object_auroc", "object_ap")
+        }
+    write_json(run_dir / "object_top_percent_sweep.json", sweep_summary)
+    if args.object_pooling_mode != "legacy":
+        write_json(run_dir / "object_top_ratio_sweep.json", sweep_summary)
+    if args.object_pooling_mode == "legacy":
+        log_line(
+            test_log,
+            "Best top-p by O-AUROC: "
+            f"top_percent={best_by_auroc['top_percent']:g}, "
+            f"object_auroc={_fmt_metric(best_by_auroc['object_auroc'])}, "
+            f"object_ap={_fmt_metric(best_by_auroc['object_ap'])}",
+        )
+        log_line(
+            test_log,
+            "Best top-p by O-AP: "
+            f"top_percent={best_by_ap['top_percent']:g}, "
+            f"object_auroc={_fmt_metric(best_by_ap['object_auroc'])}, "
+            f"object_ap={_fmt_metric(best_by_ap['object_ap'])}",
+        )
+    else:
+        log_line(
+            test_log,
+            "Configured source-selected top ratio: "
+            f"top_ratio={best_by_auroc['top_percent']:g}, "
+            f"object_auroc={_fmt_metric(best_by_auroc['object_auroc'])}, "
+            f"object_ap={_fmt_metric(best_by_auroc['object_ap'])}",
+        )
+    if args.residual_prompt_enabled:
+        test_time_seconds = time.perf_counter() - test_started
+        peak_memory = (
+            int(torch.cuda.max_memory_allocated()) if device == "cuda" else 0
+        )
+        ncrp_diagnostics = build_ncrp_diagnostics(
+            args,
+            checkpoint,
+            checkpoint_path,
+            means,
+            sample_values,
+            trainable_parameter_count,
+            test_time_seconds,
+            inference_time_seconds,
+            peak_memory,
+        )
+        sample_path = run_dir / "sample_scores.npz"
+        ncrp_diagnostics["sample_scores_size_bytes"] = (
+            sample_path.stat().st_size if sample_path.is_file() else None
+        )
+        diagnostics_path = run_dir / "ncrp_diagnostics.json"
+        write_json(diagnostics_path, ncrp_diagnostics)
+        ncrp_diagnostics["diagnostics_size_bytes"] = diagnostics_path.stat().st_size
+        write_json(diagnostics_path, ncrp_diagnostics)
+        log_line(test_log, f"NCRP diagnostics: {diagnostics_path}")
+    diagnostic_metrics = build_diagnostic_metrics(
+        args, run_dir, feature_layers, means, best_by_auroc, sample_values,
+    )
+    write_json(run_dir / "metrics.json", diagnostic_metrics)
+    log_line(test_log, f"Diagnostic metrics: {run_dir / 'metrics.json'}")
     if args.save_per_category_metrics:
         write_json(run_dir / "per_category_metrics.json", {
             "train_category": args.train_category, "test_categories": test_categories,
-            "use_geometric_cap": use_cap, "use_geometric_dap": use_dap,
-            "use_geometric_mode_prompt": use_mode_prompt,
+            "source_dataset_name": args.dataset_name,
+            "test_dataset_name": test_dataset_name,
+            "use_static_prompt": use_static_prompt,
+            "object_pooling_mode": args.object_pooling_mode,
+            "object_top_ratio": args.object_top_ratio,
+            "residual_prompt_enabled": args.residual_prompt_enabled,
+            "seed": args.seed,
+            "seed_report": seed_report,
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_seed": checkpoint.get("seed"),
             "metrics": per_category,
         })
     if args.save_mean_metrics:
         write_json(run_dir / "mean_metrics.json", {
             "train_category": args.train_category, "test_categories": test_categories, **means,
+            "source_dataset_name": args.dataset_name,
+            "test_dataset_name": test_dataset_name,
+            "object_pooling_mode": args.object_pooling_mode,
+            "object_top_ratio": args.object_top_ratio,
+            "residual_prompt_enabled": args.residual_prompt_enabled,
+            "seed": args.seed,
+            "seed_report": seed_report,
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_seed": checkpoint.get("seed"),
         })
-    log_line(test_log, f"Mean metrics: {means}")
+    log_line(
+        test_log,
+        "Mean metrics: "
+        f"object_auroc={means.get('object_auroc')} "
+        f"point_auroc={means.get('point_auroc')} "
+        f"all={means}",
+    )
+    if args.residual_prompt_enabled:
+        log_line(
+            test_log,
+            "NCRP test resources"
+            f" | test_time_seconds={time.perf_counter() - test_started:.3f}"
+            " | mean_inference_time_per_sample_seconds="
+            f"{inference_time_seconds / max(1, len(sample_values['path'])):.6f}"
+            " | peak_gpu_memory_bytes="
+            f"{int(torch.cuda.max_memory_allocated()) if device == 'cuda' else 0}",
+        )
 
 
 if __name__ == "__main__":
