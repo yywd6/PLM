@@ -1,40 +1,42 @@
 protocol: one_rest
-train_category: car
+train_categories: [airplane, car]
 exclude_train_category_from_test: true
 zero_shot_target: true
 use_target_anomaly_for_training: false
 save_per_category_metrics: true
 save_mean_metrics: true
 
-use_geometric_cap: true
-use_geometric_dap: true
-num_geometric_abnormal_prompts: 10
+# Stage 2: one learnable normal Prompt and six learnable abnormal Prompts.
+use_static_prompt: true
+static_prompt_version: static_six_prompt_v1
+use_category_prompt: true
+prompt_template: "a point cloud patch of a {category}"
+
+num_abnormal_prompts: 6
 num_normal_tokens: 4
 num_abnormal_tokens: 4
-geometric_prompt_suffix: "a point cloud patch of {article} {category}"
-top_m_abnormal_patches: 10
-lambda_prompt_orthogonal: 0.1
-lambda_prior: 0.1
+prompt_score_temperature: 0.07
+use_prompt_diversity_loss: true
+lambda_prompt_diversity: 0.01
+
 freeze_plm: true
 freeze_text_encoder: true
-freeze_visual_adapter: false
-baseline_checkpoint: null
-prompt_learning_rate: 0.001
-prior_learning_rate: 0.001
-prior_hidden_dim: 512
-patch_geo_desc_dim: 4  # legacy local descriptor setting; retained for compatibility
-geometry_graph_dim: 128
-geometry_graph_k: 8
-geometry_graph_layers: 2
-geometry_routing_temperature: 0.2
-lambda_geometry_invariance: 0
+freeze_visual_adapter: true
+baseline_checkpoint: outputs/selected_two_rest_visual_baseline_v7/Real3D/{train_category}/best.pth
+
+learning_rate: 0.001
+prompt_learning_rate: 0.0001
+weight_decay: 0.0001
+warmup_ratio: 0.1
+minimum_learning_rate: 0.000001
+gradient_clip_norm: 10.0
 
 dataset_name: Real3D
 data_root: /home/objectdec/data/Point3D/Real3D-AD-PCD_btp_fps2048
 model_path: ./pretrained/ULIP-2-PointBERT-10k-xyzrgb-pc-vit_g-objaverse_shapenet-pretrained.pt
 train_split: test
 test_split: test
-output_root: ./outputs/one_rest_geometric_cap_dap
+output_root: ./outputs/selected_two_rest_ablation_static_six_prompt_v7_uniform_scoring/Real3D
 return_layers: [2, 5, 8, 11]
 feature_layer: 11
 feature_layers: [2, 5, 8, 11]
@@ -46,7 +48,6 @@ top_percent: 0.2
 epochs: 100
 batch_size: 4
 num_workers: 4
-weight_decay: 0.0001
 focal_weight: 1.0
 dice_weight: 1.0
 object_weight: 0.5
@@ -56,6 +57,5 @@ num_points: 2048
 seed: 111
 device: cuda
 
-# Only used when use_geometric_cap=false.
 normal_templates: [a 3D point cloud of a normal object]
 anomaly_templates: [a 3D point cloud of a defective object]

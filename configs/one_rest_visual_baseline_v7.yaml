@@ -6,57 +6,23 @@ use_target_anomaly_for_training: false
 save_per_category_metrics: true
 save_mean_metrics: true
 
-# Independent geometric mode prompting path. The legacy CAP/DAP path stays off.
-use_geometric_cap: false
-use_geometric_dap: false
-use_geometric_mode_prompt: false
-geometric_mode_version: se3_mode_prompt_v7_gate_sinkhorn
+# Stage 1 trains only the feature-first four-layer visual adapter.
+use_static_prompt: false
 use_category_prompt: true
 prompt_template: "a point cloud patch of a {category}"
 
-num_geometric_modes: 6
 num_normal_tokens: 4
 num_abnormal_tokens: 4
-use_mode_specific_residual: true
-use_mode_weighted_scoring: true
-use_patch_mode_routing: true
-mode_anomaly_patch_threshold: 0.05
-use_geometry_abnormal_gate: false
-geometry_gate_logit_scale: 1.0
-lambda_geometry_gate: 0.2
-geometry_gate_margin: 0.5
-use_sinkhorn_mode_assignment: false
-lambda_mode_assignment: 0.05
-sinkhorn_epsilon: 0.05
-sinkhorn_iterations: 3
-mode_score_temperature: 0.07
-mode_score_type: logsumexp
-mode_residual_scale: 0.1
-mode_router_temperature: 0.2
-mode_prompt_hidden_dim: 512
-
-geometry_graph_dim: 128
-geometry_graph_k: 8
-geometry_graph_layers: 2
 feature_layers: [2, 5, 8, 11]
-
-use_mode_diversity_loss: true
-use_mode_entropy_loss: false
-use_residual_suppression_loss: true
-lambda_mode_diversity: 0.01
-lambda_mode_entropy: 0.05
-mode_conditional_entropy_weight: 0.5
-lambda_residual_suppression: 0.003
-lambda_se3_sanity: 0.0
 
 freeze_plm: true
 freeze_text_encoder: true
 freeze_visual_adapter: false
+visual_adapter_training_mode: fused_only
 baseline_checkpoint: null
 
 learning_rate: 0.001
 prompt_learning_rate: 0.0001
-prior_learning_rate: 0.001
 weight_decay: 0.0001
 warmup_ratio: 0.1
 minimum_learning_rate: 0.000001

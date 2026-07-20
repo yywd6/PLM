@@ -1,0 +1,21 @@
+_base_: two_rest_static_six_prompt_v1_uniform_scoring.yaml
+
+# NCRP-K1 is the only maintained NCRP method.  It keeps the category-aware
+# normal Prompt and replaces all abnormal Prompt tokens/bases with one shared
+# residual vector in the frozen text embedding space.
+static_prompt_version: ncrp_k1
+output_root: ./outputs/ncrp_k1/Real3D
+num_abnormal_prompts: 1
+
+use_prompt_diversity_loss: false
+
+residual_prompt:
+  enabled: true
+  num_bases: 1
+  gamma: 1.0
+  eps: 1.0e-6
+
+object_pooling_mode: top_mean
+object_top_ratio: 0.2
+top_percent: 0.2
+global_alpha: 0.0

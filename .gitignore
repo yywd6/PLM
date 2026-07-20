@@ -1,5 +1,6 @@
 # Local backups and archived files
 backup/
+archive_deprecated/
 
 # Experiment outputs
 outputs/

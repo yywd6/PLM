@@ -4,7 +4,12 @@ import pytest
 import torch
 
 from models.trainable_baseline import LinearPatchAdapter, patch_to_point, select_patch_tokens
-from one_rest_protocol import assert_dataset_categories, resolve_categories, validate_one_rest_flags
+from one_rest_protocol import (
+    assert_dataset_categories,
+    category_run_name,
+    resolve_categories,
+    validate_one_rest_flags,
+)
 
 
 def test_one_rest_excludes_source_category():
@@ -14,13 +19,24 @@ def test_one_rest_excludes_source_category():
     assert len(test) == 11
 
 
+def test_one_rest_excludes_two_source_categories():
+    train, test = resolve_categories(
+        "Real3D", "one_rest", train_categories=["airplane", "car"]
+    )
+    assert train == ["airplane", "car"]
+    assert "airplane" not in test
+    assert "car" not in test
+    assert len(test) == 10
+    assert category_run_name(train) == "airplane+car"
+
+
 def test_path_audit_rejects_target_leakage():
     dataset = Namespace(samples=["/data/car/test/a.npz", "/data/duck/test/b.npz"])
     with pytest.raises(RuntimeError, match="leakage"):
         assert_dataset_categories(dataset, ["car"], ["duck"])
 
 
-def test_protocol_rejects_target_training_and_new_methods():
+def test_protocol_rejects_target_category_training():
     base = dict(
         protocol="one_rest",
         exclude_train_category_from_test=True,
@@ -28,8 +44,6 @@ def test_protocol_rejects_target_training_and_new_methods():
         save_per_category_metrics=True,
         save_mean_metrics=True,
         use_target_anomaly_for_training=False,
-        use_geometric_cap=False,
-        use_geometric_dap=False,
     )
     validate_one_rest_flags(Namespace(**base))
     base["use_target_anomaly_for_training"] = True
@@ -45,3 +59,11 @@ def test_linear_adapter_and_patch_mapping_shapes():
     assert adapter(tokens).shape == (2, 3, 6)
     points = patch_to_point(torch.randn(2, 3), indices, 4)
     assert points.shape == (2, 4)
+
+
+def test_patch_to_point_preserves_float64_dtype():
+    indices = torch.tensor([[[0, 1], [1, 2], [2, 3]]] * 2)
+    values = torch.randn(2, 3, dtype=torch.float64)
+    points = patch_to_point(values, indices, 4)
+    assert points.dtype == torch.float64
+    assert torch.isfinite(points).all()
