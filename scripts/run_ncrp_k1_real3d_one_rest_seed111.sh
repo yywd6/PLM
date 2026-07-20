@@ -110,7 +110,7 @@ fi
 DATA_ROOT="$(resolve_path "${DATA_ROOT}")"
 STAGE1_ROOT="$(resolve_path "${STAGE1_ROOT}")"
 OUTPUT_ROOT="$(resolve_path "${OUTPUT_ROOT}")"
-BASELINE_CONFIG="${PROJECT_ROOT}/configs/two_rest_static_six_prompt_v1_uniform_scoring.yaml"
+BASELINE_CONFIG="${PROJECT_ROOT}/configs/one_rest_visual_baseline_v7.yaml"
 K1_CONFIG="${PROJECT_ROOT}/configs/ncrp_k1.yaml"
 for path in "${DATA_ROOT}" "${BASELINE_CONFIG}" "${K1_CONFIG}"; do
   if [[ ! -e "${path}" ]]; then
@@ -226,11 +226,7 @@ ensure_stage1() {
     --use_target_anomaly_for_training false \
     --output_root "${stage1_dataset_root}" \
     --batch_size "${BATCH_SIZE}" \
-    --seed "${SEED}" \
-    --use_static_prompt false \
-    --freeze_visual_adapter false \
-    --baseline_checkpoint "" \
-    --global_alpha 0.3
+    --seed "${SEED}"
   training_valid "${checkpoint}" "${completion}"
 }
 

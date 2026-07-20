@@ -78,6 +78,30 @@ def validate_checkpoint_file(path, required_keys=("adapter",)):
     return True, payload
 
 
+def validate_ddf3d_checkpoint_payload(payload):
+    """Validate explicit calibration/router components in a DDF-3D checkpoint."""
+    metadata = payload.get("ddf3d")
+    if not isinstance(metadata, dict) or metadata.get("enabled") is not True:
+        return False, "DDF-3D checkpoint is missing enabled metadata"
+    required = ("ddf3d_projection", "ddf3d_router", "adapter")
+    missing = [key for key in required if key not in payload]
+    if missing:
+        return False, f"DDF-3D checkpoint missing components: {missing}"
+    adapter = payload["adapter"]
+    if not isinstance(adapter, dict) or not any(
+        key.startswith("projections.") for key in adapter
+    ):
+        return False, "DDF-3D adapter state lacks layer-specific projections"
+    fusion = metadata.get("fusion_mode")
+    if fusion == "patch_softmax" and not any(
+        key.startswith("patch_router.") for key in adapter
+    ):
+        return False, "DDF-3D patch_softmax checkpoint lacks patch router state"
+    if fusion == "global_softmax" and "layer_logits" not in adapter:
+        return False, "DDF-3D global_softmax checkpoint lacks global logits"
+    return True, None
+
+
 def validate_training_artifacts(checkpoint_path, completion_path):
     checks = (
         validate_checkpoint_file(checkpoint_path),
@@ -99,6 +123,13 @@ def validate_training_artifacts(checkpoint_path, completion_path):
         and "residual_prompt" not in checks[0][1]
     ):
         errors.append(f"NCRP checkpoint is missing residual_prompt: {checkpoint_path}")
+    if (
+        not errors
+        and checks[1][1].get("ddf3d_enabled") is True
+    ):
+        ddf_valid, ddf_error = validate_ddf3d_checkpoint_payload(checks[0][1])
+        if not ddf_valid:
+            errors.append(ddf_error)
     return not errors, errors
 
 

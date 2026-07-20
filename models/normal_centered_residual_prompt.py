@@ -239,19 +239,56 @@ def forward_ncrp_k1_scores(
     clip_model,
     categories,
     temperature=0.07,
+    patch_centers=None,
 ):
     """Feature-first NCRP-K1 forward used by training and inference."""
     normal = learner.encode_normal_anchors(clip_model, categories)
     directions, projection_norms = learner.projected_directions(normal)
-    patches = adapter(layer_tokens)
-    patch_output = single_residual_logits(
-        patches,
-        normal,
-        directions,
-        gamma=learner.gamma,
-        temperature=temperature,
-        eps=learner.eps,
-    )
+    from models.ddf3d import is_ddf3d_adapter
+
+    ddf3d_output = None
+    if is_ddf3d_adapter(adapter):
+        feature_output = adapter.forward_features(layer_tokens)
+        patches = feature_output["patch_embeddings"]
+        patch_output = single_residual_logits(
+            patches,
+            normal,
+            directions,
+            gamma=learner.gamma,
+            temperature=temperature,
+            eps=learner.eps,
+        )
+        layer_margins = torch.stack(
+            [
+                single_residual_logits(
+                    layer,
+                    normal,
+                    directions,
+                    gamma=learner.gamma,
+                    temperature=temperature,
+                    eps=learner.eps,
+                )["patch_logits"]
+                for layer in feature_output["projected_layers"]
+            ],
+            dim=-1,
+        )
+        ddf3d_output = adapter.enhance_scores(
+            patch_output["patch_logits"],
+            layer_margins,
+            feature_output,
+            patch_centers,
+        )
+        patch_output = {**patch_output, **ddf3d_output}
+    else:
+        patches = adapter(layer_tokens)
+        patch_output = single_residual_logits(
+            patches,
+            normal,
+            directions,
+            gamma=learner.gamma,
+            temperature=temperature,
+            eps=learner.eps,
+        )
     global_output = single_residual_logits(
         global_embeddings.unsqueeze(1),
         normal,
@@ -272,7 +309,7 @@ def forward_ncrp_k1_scores(
     ).unsqueeze(1).expand(-1, patches.shape[1], -1)
     normal_inner = torch.einsum("bkd,bd->bk", directions, normal).abs().max(-1).values
     zeros = normal_inner.new_zeros(normal_inner.shape)
-    return {
+    output = {
         **patch_output,
         "basis_similarities": basis_similarities,
         "basis_assignments": assignments,
@@ -289,3 +326,6 @@ def forward_ncrp_k1_scores(
         "basis_normal_max_abs_inner_product": normal_inner,
         "orthogonalized_basis_gram_off_diagonal_mean": zeros,
     }
+    if ddf3d_output is not None:
+        output["ddf3d"] = ddf3d_output
+    return output

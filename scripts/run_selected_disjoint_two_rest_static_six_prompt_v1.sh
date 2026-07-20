@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-BASELINE_CONFIG="${BASELINE_CONFIG:-configs/two_rest_static_six_prompt_v1_uniform_scoring.yaml}"
+BASELINE_CONFIG="${BASELINE_CONFIG:-configs/one_rest_visual_baseline_v7.yaml}"
 EXPERIMENT_CONFIG="${EXPERIMENT_CONFIG:-}"
 STATIC_PROMPT_CONFIG="${EXPERIMENT_CONFIG:-${STATIC_PROMPT_CONFIG:-configs/two_rest_static_six_prompt_v1_uniform_scoring.yaml}}"
 BASELINE_OUTPUT_ROOT="${BASELINE_OUTPUT_ROOT:-outputs/selected_two_rest_visual_baseline_v7}"
@@ -110,7 +110,7 @@ run_pair() {
     echo "ERROR: SKIP_STAGE1=1 but Stage 1 checkpoint is invalid: ${baseline_checkpoint}" >&2
     return 1
   else
-    "${PYTHON_BIN}" train.py --config "${BASELINE_CONFIG}" --protocol one_rest --dataset_name "${dataset_name}" --data_root "${data_root}" --train_categories "${first_category}" "${second_category}" --output_root "${baseline_dataset_root}" --batch_size "${BATCH_SIZE}" --use_static_prompt false --freeze_visual_adapter false --baseline_checkpoint "" --global_alpha 0.3
+    "${PYTHON_BIN}" train.py --config "${BASELINE_CONFIG}" --protocol one_rest --dataset_name "${dataset_name}" --data_root "${data_root}" --train_categories "${first_category}" "${second_category}" --output_root "${baseline_dataset_root}" --batch_size "${BATCH_SIZE}"
     baseline_checkpoint="${baseline_run_dir}/best.pth"
   fi
 

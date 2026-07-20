@@ -211,16 +211,31 @@ def test_main_ncrp_yaml_is_k1_only():
 
 def test_no_ncrp_ablation_yaml_remains():
     assert not list((ROOT / "configs/ablations").glob("ncrp_*.yaml"))
-    assert list((ROOT / "configs").glob("*ncrp*.yaml")) == [
-        ROOT / "configs/ncrp_k1.yaml"
-    ]
+    ncrp_configs = list((ROOT / "configs").glob("*ncrp*.yaml"))
+    assert ROOT / "configs/ncrp_k1.yaml" in ncrp_configs
+    assert all(
+        path.name == "ncrp_k1.yaml"
+        or path.name == "ddf3d_ncrp_k1_base.yaml"
+        or (
+            path.name.startswith("ddf3d_")
+            and path.name.endswith("_ncrp_k1.yaml")
+        )
+        for path in ncrp_configs
+    )
 
 
-def test_only_ncrp_and_static_method_yamls_remain():
-    assert set((ROOT / "configs").rglob("*.yaml")) == {
+def test_only_ncrp_static_shared_stage1_and_ddf3d_yamls_remain():
+    configs = set((ROOT / "configs").rglob("*.yaml"))
+    maintained = {
         ROOT / "configs/ncrp_k1.yaml",
+        ROOT / "configs/one_rest_visual_baseline_v7.yaml",
         ROOT / "configs/two_rest_static_six_prompt_v1_uniform_scoring.yaml",
     }
+    assert maintained <= configs
+    assert all(
+        path in maintained or path.name.startswith("ddf3d_")
+        for path in configs
+    )
 
 
 def test_static_config_does_not_enable_ncrp():
@@ -228,3 +243,11 @@ def test_static_config_does_not_enable_ncrp():
         load_yaml(ROOT / "configs/two_rest_static_six_prompt_v1_uniform_scoring.yaml")
     )
     assert "residual_prompt_enabled" not in static
+
+
+def test_one_rest_visual_baseline_is_stage1_only():
+    visual = load_yaml(ROOT / "configs/one_rest_visual_baseline_v7.yaml")
+    assert visual["use_static_prompt"] is False
+    assert visual["freeze_visual_adapter"] is False
+    assert visual["visual_adapter_training_mode"] == "fused_only"
+    assert visual["baseline_checkpoint"] is None

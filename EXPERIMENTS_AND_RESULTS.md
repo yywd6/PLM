@@ -1029,11 +1029,12 @@ configs/ncrp_k1.yaml
 
 ### 12.13 活动方法与配置最终收敛（2026-07-18）
 
-当前仓库只维护两条方法路径：内部强基线 Static Six Prompt，以及主方法 NCRP-K1。活动 YAML 严格只剩：
+当前仓库只维护两条方法路径：内部强基线 Static Six Prompt，以及主方法 NCRP-K1；另外保留二者共用的 Stage 1 视觉 adapter 配置：
 
 ```text
 configs/two_rest_static_six_prompt_v1_uniform_scoring.yaml
 configs/ncrp_k1.yaml
+configs/one_rest_visual_baseline_v7.yaml
 ```
 
 GASP-6、HS6P、旧多基 NCRP、QR、adaptive、cover/reject 和 dual-basis 的方法配置、模型、运行/汇总脚本及对应单元测试均已删除。旧实验输出没有删除或覆盖；本文前文继续保留这些实验的历史公式、结果和失败结论，但其中列出的旧运行命令不再是当前可执行入口。

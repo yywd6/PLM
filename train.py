@@ -35,6 +35,7 @@ from models.trainable_baseline import (
     aggregate_object_probability,
     select_multi_layer_tokens,
 )
+from models.ddf3d import DDF3DAdapter, forward_ddf3d_fixed_scores
 from models.ulip2_encoder import ULIP2Encoder
 from one_rest_protocol import (
     assert_no_forbidden_config_keys,
@@ -46,10 +47,22 @@ from one_rest_protocol import (
     normalize_train_categories,
     resolve_categories,
     validate_one_rest_flags,
+    write_json,
     write_yaml,
 )
 from utils.residual_prompt_config import flatten_residual_prompt_config
+from utils.ddf3d_config import (
+    add_ddf3d_parser_arguments,
+    build_patch_adapter,
+    flatten_ddf3d_config,
+    validate_checkpoint_ddf3d_config,
+    validate_ddf3d_args,
+)
 from utils.reproducibility import dataloader_seed_kwargs, seed_everything
+from utils.ddf3d_analysis import (
+    RoutingStatistics,
+    global_routing_weights,
+)
 
 
 DEFAULT_CONFIG = "configs/two_rest_static_six_prompt_v1_uniform_scoring.yaml"
@@ -160,6 +173,7 @@ def build_parser():
     parser.add_argument("--baseline_checkpoint")
     parser.add_argument("--prompt_checkpoint")
     parser.add_argument("--resume_checkpoint")
+    add_ddf3d_parser_arguments(parser)
     return parser
 
 
@@ -167,7 +181,9 @@ def parse_args():
     first = argparse.ArgumentParser(add_help=False)
     first.add_argument("--config", default=DEFAULT_CONFIG)
     config_args, _ = first.parse_known_args()
-    config = flatten_residual_prompt_config(load_yaml(config_args.config))
+    config = flatten_ddf3d_config(
+        flatten_residual_prompt_config(load_yaml(config_args.config))
+    )
     assert_no_forbidden_config_keys(config, config_args.config)
     parser = build_parser()
     valid = {action.dest for action in parser._actions}
@@ -243,6 +259,7 @@ def parse_args():
             "checkpoint_metric=val_object_auroc requires validation_fraction > 0"
         )
     validate_one_rest_flags(args)
+    validate_ddf3d_args(args, parser)
     return args
 
 
@@ -341,6 +358,10 @@ def build_checkpoint_state(
         state[
             "residual_prompt" if args.residual_prompt_enabled else "static_prompt"
         ] = prompt_model.state_dict()
+    if isinstance(adapter, DDF3DAdapter):
+        state["ddf3d"] = adapter.checkpoint_metadata()
+        state["ddf3d_projection"] = adapter.projection_state_dict()
+        state["ddf3d_router"] = adapter.router_state_dict()
     return state
 
 
@@ -352,6 +373,7 @@ def forward_prompt_scores(
     prompt_model,
     clip_model,
     object_names,
+    patch_centers=None,
 ):
     """Route the two maintained Prompt methods: NCRP-K1 and Static."""
     if args.residual_prompt_enabled:
@@ -363,6 +385,7 @@ def forward_prompt_scores(
             clip_model,
             object_names,
             temperature=args.temperature,
+            patch_centers=patch_centers,
         )
     return forward_static_prompt_scores(
         adapter,
@@ -373,6 +396,7 @@ def forward_prompt_scores(
         object_names,
         temperature=args.temperature,
         prompt_score_temperature=args.prompt_score_temperature,
+        patch_centers=patch_centers,
     )
 
 
@@ -431,7 +455,9 @@ def evaluate_holdout_object_metrics(
         object_labels = (labels > 0).any(dim=1).float()
         features = encoder.encode_pointcloud(points, return_intermediate=True)
         tokens = select_multi_layer_tokens(
-            features["layer_feats"], features["patch_idx"], args.feature_layers
+            features.get("patch_tokens", features["layer_feats"]),
+            features["patch_idx"],
+            args.feature_layers,
         )
         if prompt_model is not None:
             category_names = PointCloudDataset.PRESETS[args.dataset_name]
@@ -446,20 +472,34 @@ def evaluate_holdout_object_metrics(
                 prompt_model,
                 encoder.open_clip_model,
                 object_names,
+                patch_centers=features["patch_centers"],
             )
             patch_logits = score_output["patch_logits"]
             global_logits = score_output["global_logits"]
         else:
-            patch_embeddings = adapter(tokens)
-            patch_logits = patch_text_logits(
-                patch_embeddings, fixed_normal, fixed_anomaly, args.temperature
-            )
-            global_logits = patch_text_logits(
-                features["concat"].unsqueeze(1),
-                fixed_normal,
-                fixed_anomaly,
-                args.temperature,
-            ).squeeze(1)
+            if isinstance(adapter, DDF3DAdapter):
+                score_output = forward_ddf3d_fixed_scores(
+                    adapter,
+                    tokens,
+                    features["patch_centers"],
+                    features["concat"],
+                    fixed_normal,
+                    fixed_anomaly,
+                    args.temperature,
+                )
+                patch_logits = score_output["patch_logits"]
+                global_logits = score_output["global_logits"]
+            else:
+                patch_embeddings = adapter(tokens)
+                patch_logits = patch_text_logits(
+                    patch_embeddings, fixed_normal, fixed_anomaly, args.temperature
+                )
+                global_logits = patch_text_logits(
+                    features["concat"].unsqueeze(1),
+                    fixed_normal,
+                    fixed_anomaly,
+                    args.temperature,
+                ).squeeze(1)
         object_probability = pool_training_object_probability(
             args, global_logits, patch_logits
         )
@@ -610,6 +650,7 @@ def build_static_prompt_model(args, encoder, adapter, device):
         validate_visual_adapter_training_mode(
             args, prompt_checkpoint, prompt_path
         )
+        validate_checkpoint_ddf3d_config(args, prompt_checkpoint, prompt_path)
         checkpoint_version = prompt_checkpoint.get(
             "static_prompt_version",
             prompt_checkpoint.get("geometric_mode_version"),
@@ -637,6 +678,7 @@ def build_static_prompt_model(args, encoder, adapter, device):
         if list(baseline.get("feature_layers", [])) != list(args.feature_layers):
             raise RuntimeError("Baseline checkpoint feature_layers mismatch")
         validate_visual_adapter_training_mode(args, baseline, baseline_path)
+        validate_checkpoint_ddf3d_config(args, baseline, baseline_path)
         adapter.load_state_dict(baseline["adapter"])
     elif args.freeze_visual_adapter:
         raise ValueError(
@@ -691,6 +733,15 @@ def main():
         args.dataset_name, args.protocol, train_categories=args.train_categories
     )
     run_dir = Path(args.output_root) / args.train_category
+    if (
+        args.ddf3d_enabled
+        and run_dir.exists()
+        and any(run_dir.iterdir())
+        and not args.resume_checkpoint
+    ):
+        raise FileExistsError(
+            f"Refusing to overwrite an existing DDF-3D run directory: {run_dir}"
+        )
     run_dir.mkdir(parents=True, exist_ok=True)
     train_log = run_dir / "train.log"
     if not args.resume_checkpoint or not train_log.is_file():
@@ -735,6 +786,15 @@ def main():
             train_log,
             "Stage 1: trainable multi-layer visual adapter"
             f" | mode={args.visual_adapter_training_mode}",
+        )
+    if args.ddf3d_enabled:
+        log_line(
+            train_log,
+            "DDF-3D enabled"
+            f" | fusion={args.ddf3d_fusion_mode}"
+            f" | layers={args.ddf3d_layers}"
+            f" | top_k={args.ddf3d_router_top_k}"
+            f" | discrepancy={args.ddf3d_discrepancy_enabled}",
         )
 
     source_dataset = PointCloudDataset(
@@ -782,9 +842,13 @@ def main():
         return_layers=tuple(args.return_layers),
         return_clip=args.use_static_prompt,
     )
-    adapter = MultiLayerPatchAdapter(
-        args.token_dim, args.text_dim, len(args.feature_layers)
-    ).to(device)
+    log_line(
+        train_log,
+        "PointBERT blocks="
+        f"{encoder.pointbert_block_count} | configured layer -> Python index="
+        f"{encoder.layer_block_indices}",
+    )
+    adapter = build_patch_adapter(args).to(device)
     parameter_counts = None
     prompt_model = build_static_prompt_model(args, encoder, adapter, device)
     if prompt_model is not None:
@@ -832,6 +896,9 @@ def main():
         resume_payload = torch.load(
             resume_path, map_location=device, weights_only=False
         )
+        if "adapter" not in resume_payload:
+            raise RuntimeError(f"Resume checkpoint lacks adapter state: {resume_path}")
+        adapter.load_state_dict(resume_payload["adapter"], strict=True)
         if "optimizer" not in resume_payload or "scheduler" not in resume_payload:
             raise RuntimeError(
                 "Resume checkpoint lacks optimizer/scheduler state: "
@@ -892,14 +959,21 @@ def main():
                 "prompt_diversity",
                 "focal",
                 "dice",
+                "route_balance",
                 "total",
             )
         }
+        routing_statistics = (
+            RoutingStatistics(adapter.layers)
+            if isinstance(adapter, DDF3DAdapter)
+            else None
+        )
         ncrp_normal_residual_sum = 0.0
         ncrp_abnormal_residual_sum = 0.0
         ncrp_normal_residual_count = 0
         ncrp_abnormal_residual_count = 0
         for batch in loader:
+            ddf3d_score_output = None
             points = batch["points"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
             category_names = PointCloudDataset.PRESETS[args.dataset_name]
@@ -911,7 +985,7 @@ def main():
                 points, return_intermediate=True
             )
             tokens = select_multi_layer_tokens(
-                features["layer_feats"],
+                features.get("patch_tokens", features["layer_feats"]),
                 features["patch_idx"],
                 args.feature_layers,
             )
@@ -925,6 +999,7 @@ def main():
                     prompt_model,
                     encoder.open_clip_model,
                     object_names,
+                    patch_centers=features["patch_centers"],
                 )
                 patch_embeddings = score_output["patch_embeddings"]
                 patch_logits = score_output["patch_logits"]
@@ -943,21 +1018,39 @@ def main():
                     )
                     residual_masks = (anomaly_mask, normal_mask)
             else:
-                patch_embeddings = adapter(tokens)
-                patch_logits = patch_text_logits(
-                    patch_embeddings,
-                    fixed_normal,
-                    fixed_anomaly,
-                    args.temperature,
-                )
+                if isinstance(adapter, DDF3DAdapter):
+                    score_output = forward_ddf3d_fixed_scores(
+                        adapter,
+                        tokens,
+                        features["patch_centers"],
+                        features["concat"],
+                        fixed_normal,
+                        fixed_anomaly,
+                        args.temperature,
+                    )
+                    patch_embeddings = score_output["patch_embeddings"]
+                    patch_logits = score_output["patch_logits"]
+                    global_logits = score_output["global_logits"]
+                else:
+                    patch_embeddings = adapter(tokens)
+                    patch_logits = patch_text_logits(
+                        patch_embeddings,
+                        fixed_normal,
+                        fixed_anomaly,
+                        args.temperature,
+                    )
+                    global_logits = patch_text_logits(
+                        features["concat"].unsqueeze(1),
+                        fixed_normal,
+                        fixed_anomaly,
+                        args.temperature,
+                    ).squeeze(1)
                 diversity = patch_embeddings.sum() * 0.0
                 residual_masks = None
-                global_logits = patch_text_logits(
-                    features["concat"].unsqueeze(1),
-                    fixed_normal,
-                    fixed_anomaly,
-                    args.temperature,
-                ).squeeze(1)
+
+            if isinstance(adapter, DDF3DAdapter):
+                ddf3d_score_output = score_output.get("ddf3d", score_output)
+                routing_statistics.update(ddf3d_score_output["routing_weights"])
 
             point_logits = patch_to_point(
                 patch_logits, features["patch_idx"], labels.shape[1]
@@ -972,6 +1065,14 @@ def main():
                 object_probability, object_labels.to(object_probability.dtype)
             )
             total = local + args.object_weight * object_value
+            route_balance = patch_logits.sum() * 0.0
+            if ddf3d_score_output is not None and any(
+                parameter.requires_grad for parameter in adapter.parameters()
+            ):
+                route_balance = adapter.route_balance_loss(
+                    ddf3d_score_output["routing_weights"]
+                )
+                total = total + args.ddf3d_route_balance_weight * route_balance
             if prompt_model is not None and args.use_prompt_diversity_loss:
                 total = total + args.lambda_prompt_diversity * diversity
             optimizer.zero_grad(set_to_none=True)
@@ -996,6 +1097,7 @@ def main():
                 ("prompt_diversity", diversity),
                 ("focal", focal_value),
                 ("dice", dice_value),
+                ("route_balance", route_balance),
                 ("total", total),
             ):
                 totals[name] += float(value.detach())
@@ -1018,6 +1120,8 @@ def main():
             display_names.append("prompt_diversity")
         if prompt_model is not None and args.residual_prompt_enabled:
             display_names = ["focal", "dice", "object"]
+        if isinstance(adapter, DDF3DAdapter):
+            display_names.append("route_balance")
         display_names.append("total")
         epoch_message = f"Epoch {epoch + 1}/{epochs} | " + " | ".join(
             f"{name}={averages[name]:.6f}" for name in display_names
@@ -1077,12 +1181,36 @@ def main():
         }
         if args.residual_prompt_enabled:
             ncrp_training_curve.append(ncrp_epoch)
+        if isinstance(adapter, DDF3DAdapter):
+            if adapter.settings.fusion_mode == "global_softmax":
+                routing_result = global_routing_weights(
+                    adapter.layers, adapter.layer_weights()
+                )
+            else:
+                routing_result = routing_statistics.result()
+            write_json(
+                run_dir
+                / "routing_stats"
+                / args.train_category
+                / "train.json",
+                routing_result,
+            )
+            layer_weight_values = (
+                list(routing_result.get("mean_weight", {}).values())
+                if "mean_weight" in routing_result
+                else list(routing_result.values())
+                if adapter.settings.fusion_mode == "global_softmax"
+                else None
+            )
+        else:
+            routing_result = None
+            layer_weight_values = [
+                float(value) for value in adapter.layer_weights().detach().cpu()
+            ]
         final_training_statistics = {
             "visual_adapter_training_mode": args.visual_adapter_training_mode,
-            "visual_adapter_layer_weights": [
-                float(value)
-                for value in adapter.layer_weights().detach().cpu()
-            ],
+            "visual_adapter_layer_weights": layer_weight_values,
+            "ddf3d_routing": routing_result,
             "ncrp": {
                 "enabled": bool(args.residual_prompt_enabled),
                 **ncrp_epoch,
@@ -1269,6 +1397,13 @@ def main():
             "residual_num_bases": args.residual_num_bases,
             "residual_gamma": args.residual_gamma,
             "residual_eps": args.residual_eps,
+            "ddf3d_enabled": bool(args.ddf3d_enabled),
+            "ddf3d_fusion_mode": (
+                args.ddf3d_fusion_mode if args.ddf3d_enabled else None
+            ),
+            "ddf3d_layers": (
+                list(args.ddf3d_layers) if args.ddf3d_enabled else None
+            ),
             "prompt_parameter_counts": parameter_counts,
             "training_statistics": final_training_statistics,
             "training_time_seconds": training_time_seconds,

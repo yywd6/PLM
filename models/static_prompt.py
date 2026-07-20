@@ -239,17 +239,54 @@ def forward_static_prompt_scores(
     categories,
     temperature=0.07,
     prompt_score_temperature=0.07,
+    patch_centers=None,
 ):
     """Feature-first Static Six Prompt forward shared by train and test."""
-    patch_embeddings = adapter(layer_tokens)
     prompts = encode_static_prompts(learner, clip_model, categories)
-    patch_logits = static_prompt_anomaly_logits(
-        patch_embeddings,
-        prompts["normal_text_embed"],
-        prompts["abnormal_text_embeds"],
-        temperature,
-        prompt_score_temperature,
-    )
+    # Import locally so the legacy Prompt module does not depend on DDF-3D at
+    # import time.  The non-DDF path below is byte-for-byte equivalent in math.
+    from models.ddf3d import is_ddf3d_adapter
+
+    ddf3d_output = None
+    if is_ddf3d_adapter(adapter):
+        feature_output = adapter.forward_features(layer_tokens)
+        patch_embeddings = feature_output["patch_embeddings"]
+        semantic_logits = static_prompt_anomaly_logits(
+            patch_embeddings,
+            prompts["normal_text_embed"],
+            prompts["abnormal_text_embeds"],
+            temperature,
+            prompt_score_temperature,
+        )
+        layer_margins = torch.stack(
+            [
+                static_prompt_anomaly_logits(
+                    layer,
+                    prompts["normal_text_embed"],
+                    prompts["abnormal_text_embeds"],
+                    temperature,
+                    prompt_score_temperature,
+                )
+                for layer in feature_output["projected_layers"]
+            ],
+            dim=-1,
+        )
+        ddf3d_output = adapter.enhance_scores(
+            semantic_logits,
+            layer_margins,
+            feature_output,
+            patch_centers,
+        )
+        patch_logits = ddf3d_output["patch_logits"]
+    else:
+        patch_embeddings = adapter(layer_tokens)
+        patch_logits = static_prompt_anomaly_logits(
+            patch_embeddings,
+            prompts["normal_text_embed"],
+            prompts["abnormal_text_embeds"],
+            temperature,
+            prompt_score_temperature,
+        )
     global_logits = static_prompt_anomaly_logits(
         global_embeddings.unsqueeze(1),
         prompts["normal_text_embed"],
@@ -257,7 +294,7 @@ def forward_static_prompt_scores(
         temperature,
         prompt_score_temperature,
     ).squeeze(1)
-    return {
+    output = {
         "patch_logits": patch_logits,
         "global_logits": global_logits,
         "patch_embeddings": patch_embeddings,
@@ -265,6 +302,10 @@ def forward_static_prompt_scores(
         "normal_text_embed": prompts["normal_text_embed"],
         "abnormal_text_embeds": prompts["abnormal_text_embeds"],
     }
+    if ddf3d_output is not None:
+        output.update(ddf3d_output)
+        output["ddf3d"] = ddf3d_output
+    return output
 
 
 def point_mask_to_patch_targets(point_labels, patch_indices, threshold=0.05):

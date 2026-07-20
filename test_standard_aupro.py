@@ -29,6 +29,7 @@ from models.trainable_baseline import (
     aggregate_object_probability,
     select_multi_layer_tokens,
 )
+from models.ddf3d import DDF3DAdapter, forward_ddf3d_fixed_scores
 from models.ulip2_encoder import ULIP2Encoder
 from one_rest_protocol import (
     assert_no_forbidden_config_keys,
@@ -41,8 +42,20 @@ from one_rest_protocol import (
     resolve_categories,
     validate_one_rest_flags,
     write_json,
+    write_yaml,
 )
 from utils.residual_prompt_config import flatten_residual_prompt_config
+from utils.ddf3d_config import (
+    add_ddf3d_parser_arguments,
+    build_patch_adapter_from_checkpoint,
+    flatten_ddf3d_config,
+    validate_ddf3d_args,
+)
+from utils.ddf3d_analysis import (
+    DiscrepancyStatistics,
+    RoutingStatistics,
+    global_routing_weights,
+)
 from utils.reproducibility import dataloader_seed_kwargs, seed_everything
 
 
@@ -142,6 +155,7 @@ def build_parser():
     )
     parser.add_argument("--baseline_checkpoint")
     parser.add_argument("--prompt_checkpoint")
+    add_ddf3d_parser_arguments(parser)
     return parser
 
 
@@ -149,7 +163,9 @@ def parse_args():
     first = argparse.ArgumentParser(add_help=False)
     first.add_argument("--config", default=DEFAULT_CONFIG)
     config_args, _ = first.parse_known_args()
-    config = flatten_residual_prompt_config(load_yaml(config_args.config))
+    config = flatten_ddf3d_config(
+        flatten_residual_prompt_config(load_yaml(config_args.config))
+    )
     assert_no_forbidden_config_keys(config, config_args.config)
     parser = build_parser()
     recognized = {action.dest for action in parser._actions}
@@ -182,6 +198,7 @@ def parse_args():
     if not 0 < args.object_top_ratio <= 1:
         parser.error("object_top_ratio must be in (0, 1]")
     validate_one_rest_flags(args)
+    validate_ddf3d_args(args, parser)
     return args
 
 
@@ -286,6 +303,7 @@ def forward_prompt_scores(
     prompt_model,
     clip_model,
     object_names,
+    patch_centers=None,
 ):
     if args.residual_prompt_enabled:
         return forward_ncrp_k1_scores(
@@ -296,6 +314,7 @@ def forward_prompt_scores(
             clip_model,
             object_names,
             temperature=args.temperature,
+            patch_centers=patch_centers,
         )
     return forward_static_prompt_scores(
         adapter,
@@ -306,6 +325,7 @@ def forward_prompt_scores(
         object_names,
         temperature=args.temperature,
         prompt_score_temperature=args.prompt_score_temperature,
+        patch_centers=patch_centers,
     )
 
 
@@ -636,6 +656,10 @@ def main():
     test_data_root = args.test_data_root or args.data_root
     checkpoint_run_dir = Path(args.output_root) / args.train_category
     run_dir = Path(args.output_dir) if args.output_dir else checkpoint_run_dir
+    if (run_dir / "evaluation_complete.yaml").is_file():
+        raise FileExistsError(
+            f"Refusing to overwrite completed evaluation: {run_dir}"
+        )
     run_dir.mkdir(parents=True, exist_ok=True)
     test_log = run_dir / "test.log"
     test_log.write_text("", encoding="utf-8")
@@ -645,6 +669,14 @@ def main():
     log_line(test_log, f"Train categories: {train_categories}")
     log_line(test_log, f"Test categories: {test_categories}")
     log_line(test_log, f"Seed report: {seed_report}")
+    if args.ddf3d_enabled:
+        log_line(
+            test_log,
+            "DDF-3D enabled"
+            f" | fusion={args.ddf3d_fusion_mode}"
+            f" | layers={args.ddf3d_layers}"
+            f" | top_k={args.ddf3d_router_top_k}",
+        )
     sweep_top_percent = resolve_sweep_top_percent(args)
     log_line(test_log, f"Object score mode: {args.object_score_mode}")
     log_line(test_log, f"Object top_p sweep: {sweep_top_percent}")
@@ -737,13 +769,23 @@ def main():
         args.model_path, device=device, num_points=args.num_points,
         return_layers=tuple(args.return_layers), return_clip=use_static_prompt,
     )
-    adapter = MultiLayerPatchAdapter(
-        checkpoint.get("token_dim", args.token_dim),
-        checkpoint.get("text_dim", args.text_dim),
-        len(checkpoint_feature_layers),
-    ).to(device)
+    log_line(
+        test_log,
+        "PointBERT blocks="
+        f"{encoder.pointbert_block_count} | configured layer -> Python index="
+        f"{encoder.layer_block_indices}",
+    )
+    adapter = build_patch_adapter_from_checkpoint(args, checkpoint).to(device)
     adapter.load_state_dict(checkpoint["adapter"])
     adapter.eval()
+    ddf3d_state_before = (
+        {
+            key: value.detach().cpu().clone()
+            for key, value in adapter.state_dict().items()
+        }
+        if isinstance(adapter, DDF3DAdapter)
+        else None
+    )
     prompt_model = build_static_prompt_model(args, encoder, checkpoint, device)
     trainable_parameter_count = (
         sum(parameter.numel() for parameter in prompt_model.parameters())
@@ -758,6 +800,13 @@ def main():
 
     values = defaultdict(lambda: defaultdict(list))
     sample_values = defaultdict(list)
+    routing_statistics = {
+        name: RoutingStatistics(adapter.layers)
+        for name in test_categories
+    } if isinstance(adapter, DDF3DAdapter) else {}
+    discrepancy_statistics = {
+        name: DiscrepancyStatistics() for name in test_categories
+    } if isinstance(adapter, DDF3DAdapter) else {}
     inference_time_seconds = 0.0
     category_names = PointCloudDataset.PRESETS[test_dataset_name]
     for batch in tqdm(loader, desc=f"Test source={args.train_category}", dynamic_ncols=True):
@@ -769,7 +818,9 @@ def main():
         object_names = [category_names[int(category)] for category in batch["category"]]
         features = encoder.encode_pointcloud(points, return_intermediate=True)
         tokens = select_multi_layer_tokens(
-            features["layer_feats"], features["patch_idx"], feature_layers
+            features.get("patch_tokens", features["layer_feats"]),
+            features["patch_idx"],
+            feature_layers,
         )
         if prompt_model is not None:
             score_output = forward_prompt_scores(
@@ -780,21 +831,36 @@ def main():
                 prompt_model,
                 encoder.open_clip_model,
                 object_names,
+                patch_centers=features["patch_centers"],
             )
             patch_embeddings = score_output["patch_embeddings"]
             patch_logits = score_output["patch_logits"]
             global_logits = score_output["global_logits"]
         else:
-            patch_embeddings = adapter(tokens)
-            patch_logits = patch_text_logits(
-                patch_embeddings, fixed_normal, fixed_anomaly, args.temperature
-            )
-            global_logits = patch_text_logits(
-                features["concat"].unsqueeze(1),
-                fixed_normal,
-                fixed_anomaly,
-                args.temperature,
-            ).squeeze(1)
+            if isinstance(adapter, DDF3DAdapter):
+                score_output = forward_ddf3d_fixed_scores(
+                    adapter,
+                    tokens,
+                    features["patch_centers"],
+                    features["concat"],
+                    fixed_normal,
+                    fixed_anomaly,
+                    args.temperature,
+                )
+                patch_embeddings = score_output["patch_embeddings"]
+                patch_logits = score_output["patch_logits"]
+                global_logits = score_output["global_logits"]
+            else:
+                patch_embeddings = adapter(tokens)
+                patch_logits = patch_text_logits(
+                    patch_embeddings, fixed_normal, fixed_anomaly, args.temperature
+                )
+                global_logits = patch_text_logits(
+                    features["concat"].unsqueeze(1),
+                    fixed_normal,
+                    fixed_anomaly,
+                    args.temperature,
+                ).squeeze(1)
         patch_probabilities = torch.sigmoid(patch_logits.double())
         point_scores_tensor = patch_to_point(
             patch_logits, features["patch_idx"], labels.shape[1]
@@ -814,13 +880,14 @@ def main():
         patch_logit_values = patch_logits.detach().cpu().numpy()
         patch_probability_values = patch_probabilities.cpu().numpy()
         points_for_save = points.detach().cpu().numpy()
-        if args.residual_prompt_enabled:
+        if args.residual_prompt_enabled or isinstance(adapter, DDF3DAdapter):
             patch_anomaly_mask, _, _, _ = patch_mask_targets(
                 labels.to(device),
                 features["patch_idx"],
                 args.patch_anomaly_threshold,
             )
             patch_label_values = patch_anomaly_mask.detach().cpu().numpy()
+        if args.residual_prompt_enabled:
             basis_assignment_values = score_output["basis_assignments"].detach().cpu().numpy()
             basis_similarity_values = score_output["basis_similarities"].detach().cpu().numpy()
             residual_norm_values = score_output["residual_norms"].detach().cpu().numpy()
@@ -842,6 +909,19 @@ def main():
         paths = batch.get("path", [""] * len(batch["category"]))
         for index, category in enumerate(batch["category"]):
             name = category_names[int(category)]
+            if isinstance(adapter, DDF3DAdapter):
+                ddf3d_output = score_output.get("ddf3d", score_output)
+                routing_statistics[name].update(
+                    ddf3d_output["routing_weights"][index : index + 1]
+                )
+                discrepancy_statistics[name].update(
+                    {
+                        key: value[index : index + 1]
+                        for key, value in ddf3d_output.items()
+                        if torch.is_tensor(value)
+                    },
+                    patch_anomaly_mask[index : index + 1],
+                )
             point_labels = labels[index].numpy().reshape(-1)
             object_label = int((point_labels > 0).any())
             values[name]["object_labels"].append(object_label)
@@ -888,6 +968,36 @@ def main():
                 patch_probability_values[index].copy()
             )
 
+    if isinstance(adapter, DDF3DAdapter):
+        for target_name in test_categories:
+            if adapter.settings.fusion_mode == "global_softmax":
+                routing_payload = global_routing_weights(
+                    adapter.layers, adapter.layer_weights()
+                )
+            else:
+                routing_payload = routing_statistics[target_name].result()
+            routing_path = (
+                run_dir
+                / "routing_stats"
+                / args.train_category
+                / f"{target_name}.json"
+            )
+            discrepancy_path = (
+                run_dir
+                / "discrepancy_stats"
+                / args.train_category
+                / f"{target_name}.json"
+            )
+            write_json(routing_path, routing_payload)
+            write_json(
+                discrepancy_path,
+                discrepancy_statistics[target_name].result(),
+            )
+        log_line(
+            test_log,
+            "Saved compact DDF-3D routing/discrepancy statistics for "
+            f"{len(test_categories)} target categories",
+        )
 
     if args.save_sample_scores:
         score_payload = {
@@ -1164,6 +1274,42 @@ def main():
             " | peak_gpu_memory_bytes="
             f"{int(torch.cuda.max_memory_allocated()) if device == 'cuda' else 0}",
         )
+    if isinstance(adapter, DDF3DAdapter):
+        state_after = adapter.state_dict()
+        changed = [
+            key
+            for key, before in ddf3d_state_before.items()
+            if not torch.equal(before, state_after[key].detach().cpu())
+        ]
+        if changed:
+            raise RuntimeError(
+                f"DDF-3D parameters changed during target evaluation: {changed}"
+            )
+    write_yaml(
+        run_dir / "evaluation_complete.yaml",
+        {
+            "complete": True,
+            "ddf3d_enabled": isinstance(adapter, DDF3DAdapter),
+            "fusion_mode": (
+                adapter.settings.fusion_mode
+                if isinstance(adapter, DDF3DAdapter)
+                else None
+            ),
+            "train_category": args.train_category,
+            "test_categories": list(test_categories),
+            "checkpoint_path": str(checkpoint_path),
+            "router_updated_during_test": (
+                False if isinstance(adapter, DDF3DAdapter) else None
+            ),
+            "test_time_seconds": time.perf_counter() - test_started,
+            "inference_time_seconds": inference_time_seconds,
+            "peak_gpu_memory_bytes": (
+                int(torch.cuda.max_memory_allocated())
+                if device == "cuda"
+                else 0
+            ),
+        },
+    )
 
 
 if __name__ == "__main__":

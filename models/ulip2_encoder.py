@@ -31,6 +31,20 @@ class ULIP2Encoder:
 
         self.model = self._load_model(model_path)
         self.model.eval()
+        block_count = len(self.model.point_encoder.blocks.blocks)
+        invalid = [layer for layer in self.return_layers if not 1 <= int(layer) <= block_count]
+        if invalid:
+            raise ValueError(
+                f"Requested PointBERT layers {invalid} outside 1..{block_count}"
+            )
+        self.pointbert_block_count = block_count
+        self.layer_block_indices = {
+            int(layer): int(layer) - 1 for layer in self.return_layers
+        }
+        print(
+            "PointBERT requested layers (1-based -> Python block index): "
+            f"{self.layer_block_indices}"
+        )
 
     def _load_model(self, model_path: str):
         """Load the ULIP2 model from checkpoint."""
@@ -107,11 +121,44 @@ class ULIP2Encoder:
                 for k in features:
                     features[k] = F.normalize(features[k], dim=-1)
 
+                patch_count = center.shape[1]
+                patch_tokens = {}
+                layer_cls_tokens = {}
+                reference_shape = None
+                for layer in self.return_layers:
+                    if layer not in features:
+                        raise RuntimeError(
+                            f"PointBERT did not return requested layer {layer}"
+                        )
+                    sequence = features[layer]
+                    if sequence.shape[1] != patch_count + 1:
+                        raise RuntimeError(
+                            f"Layer {layer} sequence has {sequence.shape[1]} tokens; "
+                            f"expected one CLS plus {patch_count} patches"
+                        )
+                    layer_cls_tokens[layer] = sequence[:, 0, :].contiguous()
+                    tokens = sequence[:, 1:, :].contiguous()
+                    current_shape = tuple(tokens.shape)
+                    if reference_shape is None:
+                        reference_shape = current_shape
+                    elif current_shape != reference_shape:
+                        raise RuntimeError(
+                            "Requested PointBERT patch-token shapes differ: "
+                            f"{reference_shape} versus {current_shape} at layer {layer}"
+                        )
+                    patch_tokens[layer] = tokens
+
                 return {
                     'concat': concat_f,
                     'global': global_feat,
                     'local': local_feat,
                     'layer_feats': features,
+                    # DDF-3D structured aliases.  Existing keys remain unchanged.
+                    'patch_tokens': patch_tokens,
+                    'layer_cls_tokens': layer_cls_tokens,
+                    'cls_token': global_feat,
+                    'patch_centers': center,
+                    'final_output': concat_f,
                     'neighborhood': neighborhood,
                     'center': center,
                     'patch_idx': patch_idx
